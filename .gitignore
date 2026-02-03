@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Output files
+output/
+output_template_test/
+
+# Excel data files (sensitive)
+*.xlsm
+*.xlsx
+!input_template.xlsx
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
