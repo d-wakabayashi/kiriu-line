@@ -381,6 +381,7 @@ def save_solution_json(
 def generate_all_outputs(
     result: OptimizationResult,
     capacities: dict[str, int] | None = None,
+    output_dir: str | None = None,
 ) -> None:
     """
     全ての出力ファイルを生成
@@ -388,13 +389,22 @@ def generate_all_outputs(
     Args:
         result: 最適化結果
         capacities: ライン能力辞書
+        output_dir: 出力ディレクトリパス（指定時は各ファイルをこのディレクトリに出力）
     """
     print("\n出力ファイル生成中...")
 
-    plot_line_loads(result, capacities)
-    plot_load_summary(result, capacities)
-    report = generate_text_report(result, capacities)
-    save_solution_json(result)
+    if output_dir:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        plot_line_loads(result, capacities, output_path=str(out / 'line_loads.png'))
+        plot_load_summary(result, capacities, output_path=str(out / 'load_summary.png'))
+        report = generate_text_report(result, capacities, output_path=str(out / 'optimization_report.txt'))
+        save_solution_json(result, output_path=str(out / 'solution.json'))
+    else:
+        plot_line_loads(result, capacities)
+        plot_load_summary(result, capacities)
+        report = generate_text_report(result, capacities)
+        save_solution_json(result)
 
     print("\n" + report)
 

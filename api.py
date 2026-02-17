@@ -46,6 +46,7 @@ class OptimizeRequest(BaseModel):
     parts: list[PartInput]
     capacities: dict[str, int | list[int]] | None = None  # 月別能力対応
     time_limit: int = 60
+    load_rate_limit: float = 1.0  # 負荷率上限（0.0〜1.0）
 
 
 class LineLoadOutput(BaseModel):
@@ -162,7 +163,7 @@ def run_optimization(request: OptimizeRequest):
 
     # 最適化実行
     try:
-        result = optimize(specs, demands, capacities, request.time_limit)
+        result = optimize(specs, demands, capacities, request.time_limit, request.load_rate_limit)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"最適化エラー: {str(e)}")
 
@@ -252,26 +253,16 @@ class SimpleOptimizeRequest(BaseModel):
     # 能力データ: [[ライン, 4月, 5月, ..., 3月], ...] または [[ライン, 能力], ...]
     capacities_data: list[list[Any]] | None = None
     time_limit: int = 60
+    load_rate_limit: float = 1.0  # 負荷率上限（0.0〜1.0）
 
 
-@app.post("/optimize/simple")
-def run_simple_optimization(request: SimpleOptimizeRequest):
-    """
-    シンプル版最適化（スプレッドシートから直接呼び出し用）
-
-    parts_data形式:
-    [
-        ["部品番号", "メインライン", "サブ1", "サブ2", 4月, 5月, ..., 3月],
-        ["PART001", "4915", "4919", "", 1000, 1000, ..., 1000],
-        ...
-    ]
-    """
+def _parse_simple_request(request: SimpleOptimizeRequest):
+    """シンプル版リクエストからspecs, demands, capacitiesを抽出する共通ヘルパー"""
     specs = {}
     demands = {}
 
-    # ヘッダー行をスキップして処理
     for row in request.parts_data:
-        if len(row) < 16:  # 部品番号 + ライン3つ + 12ヶ月
+        if len(row) < 16:
             continue
 
         part_num = str(row[0]).strip()
@@ -313,7 +304,6 @@ def run_simple_optimization(request: SimpleOptimizeRequest):
     if not specs:
         raise HTTPException(status_code=400, detail="有効な部品データがありません")
 
-    # 能力設定（月別対応）
     capacities = {}
     if request.capacities_data:
         for row in request.capacities_data:
@@ -324,7 +314,6 @@ def run_simple_optimization(request: SimpleOptimizeRequest):
                 continue
 
             if len(row) >= 13:
-                # 月別能力形式: [ライン, 4月, 5月, ..., 3月]
                 monthly_caps = []
                 for i in range(1, 13):
                     try:
@@ -334,20 +323,35 @@ def run_simple_optimization(request: SimpleOptimizeRequest):
                     monthly_caps.append(max(0, val))
                 capacities[line] = monthly_caps
             else:
-                # 固定能力形式: [ライン, 能力]
                 try:
                     cap = int(float(row[1]))
                     capacities[line] = cap
                 except (ValueError, TypeError):
                     pass
 
-    # 不足しているラインのデフォルト能力を追加
     for line in DISC_LINES:
         if line not in capacities:
             capacities[line] = DEFAULT_CAPACITIES.get(line, 50000)
 
+    return specs, demands, capacities
+
+
+@app.post("/optimize/simple")
+def run_simple_optimization(request: SimpleOptimizeRequest):
+    """
+    シンプル版最適化（スプレッドシートから直接呼び出し用）
+
+    parts_data形式:
+    [
+        ["部品番号", "メインライン", "サブ1", "サブ2", 4月, 5月, ..., 3月],
+        ["PART001", "4915", "4919", "", 1000, 1000, ..., 1000],
+        ...
+    ]
+    """
+    specs, demands, capacities = _parse_simple_request(request)
+
     # 最適化実行
-    result = optimize(specs, demands, capacities, request.time_limit)
+    result = optimize(specs, demands, capacities, request.time_limit, request.load_rate_limit)
 
     # 月別能力を正規化
     def normalize_caps(caps):
@@ -409,6 +413,207 @@ def run_simple_optimization(request: SimpleOptimizeRequest):
         "parts_count": len(specs),
         "total_demand": sum(sum(d.monthly_demand) for d in demands.values()),
         "total_unmet": total_unmet,
+    }
+
+
+# ============================================================
+# 複数負荷率パターン比較API
+# ============================================================
+
+LOAD_RATE_PATTERNS = [1.0, 0.9, 0.8]
+
+
+class CompareOptimizeRequest(BaseModel):
+    """複数パターン比較リクエスト（2次元配列形式）"""
+    parts_data: list[list[Any]]
+    capacities_data: list[list[Any]] | None = None
+    time_limit: int = 60
+    load_rate_patterns: list[float] | None = None  # カスタムパターン（省略時は100/90/80%）
+
+
+@app.post("/optimize/simple/compare")
+def run_compare_optimization(request: CompareOptimizeRequest):
+    """
+    複数負荷率パターンで最適化を実行し、比較結果を返す
+
+    3パターン（100%/90%/80%）で最適化を実行し、
+    各パターンの結果と比較サマリーをスプレッドシート用の2次元配列で返す
+    """
+    # SimpleOptimizeRequestと同じパース処理を利用
+    simple_req = SimpleOptimizeRequest(
+        parts_data=request.parts_data,
+        capacities_data=request.capacities_data,
+        time_limit=request.time_limit,
+    )
+    specs, demands, capacities = _parse_simple_request(simple_req)
+
+    patterns = request.load_rate_patterns or LOAD_RATE_PATTERNS
+
+    # 月別能力を正規化
+    def normalize_caps(caps):
+        normalized = {}
+        for line in DISC_LINES:
+            cap = caps.get(line, DEFAULT_CAPACITIES.get(line, 0))
+            if isinstance(cap, list):
+                normalized[line] = (cap + [cap[-1]] * 12)[:12] if cap else [0] * 12
+            else:
+                normalized[line] = [cap] * 12
+        return normalized
+
+    monthly_capacities = normalize_caps(capacities)
+
+    # 各パターンで最適化実行
+    pattern_results = {}
+    for rate in patterns:
+        try:
+            result = optimize(specs, demands, capacities, request.time_limit, load_rate_limit=rate)
+            pattern_results[rate] = result
+        except Exception as e:
+            pattern_results[rate] = None
+
+    # === パターン比較サマリー（2次元配列） ===
+    summary_array = [["負荷率上限", "ステータス", "目的関数値", "実行時間(秒)", "平均負荷率", "未割当合計"]]
+    for rate in patterns:
+        result = pattern_results[rate]
+        if result is None:
+            summary_array.append([f"{int(rate * 100)}%", "ERROR", "", "", "", ""])
+            continue
+        total_load = sum(sum(loads) for loads in result.line_loads.values())
+        total_cap_annual = sum(sum(c) for c in monthly_capacities.values())
+        avg_rate_val = total_load / total_cap_annual if total_cap_annual > 0 else 0
+        total_unmet = sum(sum(u) for u in result.unmet_demand.values()) if result.unmet_demand else 0
+        summary_array.append([
+            f"{int(rate * 100)}%",
+            result.status,
+            result.objective_value,
+            round(result.solve_time, 2),
+            f"{avg_rate_val:.1%}",
+            total_unmet,
+        ])
+
+    # === ライン別負荷率比較（2次元配列） ===
+    line_comparison_header = ["ライン", "平均能力"]
+    for rate in patterns:
+        pct = int(rate * 100)
+        line_comparison_header.extend([f"平均負荷({pct}%)", f"負荷率({pct}%)"])
+    line_comparison_array = [line_comparison_header]
+
+    for line in DISC_LINES:
+        line_caps = monthly_capacities.get(line, [0] * 12)
+        avg_cap = sum(line_caps) / 12
+        row = [line, int(avg_cap)]
+        for rate in patterns:
+            result = pattern_results[rate]
+            if result is None:
+                row.extend(["", ""])
+                continue
+            loads = result.line_loads.get(line, [0] * 12)
+            avg_load = sum(loads) / 12
+            load_rate_val = avg_load / avg_cap if avg_cap > 0 else 0
+            row.extend([int(avg_load), f"{load_rate_val:.1%}"])
+        line_comparison_array.append(row)
+
+    # === ライン別月別負荷（パターン別、2次元配列） ===
+    # 各パターンのライン負荷を個別に返す
+    patterns_line_loads = {}
+    for rate in patterns:
+        pct = int(rate * 100)
+        result = pattern_results[rate]
+        if result is None:
+            patterns_line_loads[f"{pct}pct"] = []
+            continue
+
+        line_loads_array = [["ライン"] + MONTHS + ["平均能力", "平均負荷", "負荷率"]]
+        for line in DISC_LINES:
+            loads = result.line_loads.get(line, [0] * 12)
+            line_caps = monthly_capacities.get(line, [0] * 12)
+            avg_cap = sum(line_caps) / 12
+            avg_load = sum(loads) / 12
+            load_rate_val = avg_load / avg_cap if avg_cap > 0 else 0
+            line_loads_array.append(
+                [line] + loads + [int(avg_cap), int(avg_load), f"{load_rate_val:.1%}"]
+            )
+        patterns_line_loads[f"{pct}pct"] = line_loads_array
+
+    # === 部品割当（パターン別） ===
+    patterns_allocations = {}
+    for rate in patterns:
+        pct = int(rate * 100)
+        result = pattern_results[rate]
+        if result is None:
+            patterns_allocations[f"{pct}pct"] = []
+            continue
+
+        alloc_array = [["部品番号", "割当ライン"] + MONTHS + ["年間計"]]
+        for part_num in sorted(result.allocation.keys()):
+            for line, monthly in result.allocation[part_num].items():
+                if sum(monthly) > 0:
+                    alloc_array.append([part_num, line] + monthly + [sum(monthly)])
+        patterns_allocations[f"{pct}pct"] = alloc_array
+
+    # === 未割当比較（2次元配列） ===
+    unmet_comparison_header = ["部品番号"]
+    for rate in patterns:
+        unmet_comparison_header.append(f"未割当({int(rate * 100)}%)")
+    unmet_comparison_array = [unmet_comparison_header]
+
+    all_unmet_parts = set()
+    for result in pattern_results.values():
+        if result and result.unmet_demand:
+            for part_num, monthly in result.unmet_demand.items():
+                if sum(monthly) > 0:
+                    all_unmet_parts.add(part_num)
+
+    for part_num in sorted(all_unmet_parts):
+        row = [part_num]
+        for rate in patterns:
+            result = pattern_results[rate]
+            if result and result.unmet_demand and part_num in result.unmet_demand:
+                row.append(sum(result.unmet_demand[part_num]))
+            else:
+                row.append(0)
+        unmet_comparison_array.append(row)
+
+    # === パターン別未割当詳細 ===
+    patterns_unmet = {}
+    for rate in patterns:
+        pct = int(rate * 100)
+        result = pattern_results[rate]
+        if result is None:
+            patterns_unmet[f"{pct}pct"] = []
+            continue
+
+        unmet_array = [["部品番号"] + MONTHS + ["年間計"]]
+        if result.unmet_demand:
+            for part_num in sorted(result.unmet_demand.keys()):
+                monthly_unmet = result.unmet_demand[part_num]
+                if sum(monthly_unmet) > 0:
+                    unmet_array.append([part_num] + monthly_unmet + [sum(monthly_unmet)])
+        patterns_unmet[f"{pct}pct"] = unmet_array
+
+    # 全体サマリー
+    total_demand = sum(sum(d.monthly_demand) for d in demands.values())
+    first_result = pattern_results.get(patterns[0])
+
+    return {
+        "success": any(
+            r is not None and r.status in ('OPTIMAL', 'FEASIBLE')
+            for r in pattern_results.values()
+        ),
+        "patterns": [int(r * 100) for r in patterns],
+        "parts_count": len(specs),
+        "total_demand": total_demand,
+        # 比較データ
+        "comparison_summary": summary_array,
+        "line_comparison": line_comparison_array,
+        "unmet_comparison": unmet_comparison_array,
+        # パターン別詳細データ
+        "patterns_line_loads": patterns_line_loads,
+        "patterns_allocations": patterns_allocations,
+        "patterns_unmet": patterns_unmet,
+        # キャパシティ（共通）
+        "capacities": [["ライン"] + MONTHS]
+            + [[line] + monthly_capacities[line] for line in DISC_LINES],
     }
 
 

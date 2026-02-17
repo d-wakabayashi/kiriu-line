@@ -19,6 +19,7 @@ from pathlib import Path
 from config import (
     DEFAULT_CAPACITIES,
     DEFAULT_TIME_LIMIT_SECONDS,
+    DISC_LINES,
     OUTPUT_DIR,
     SPEC_FILE,
     PLAN_FILE,
@@ -28,6 +29,9 @@ from data_loader import load_all_data, load_equipment_spec, load_production_plan
 from model import optimize
 from visualize import generate_all_outputs, generate_text_report
 from excel_output import export_to_excel
+
+# 負荷率パターン（100%, 90%, 80%）
+LOAD_RATE_PATTERNS = [1.0, 0.9, 0.8]
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,42 +205,79 @@ def run_with_template(template_path: str) -> int:
     for line, cap in sorted(capacities.items()):
         print(f"  {line}: {cap:,}")
 
-    # 最適化実行
-    print("\n【最適化実行】")
-    result = optimize(specs, demands, capacities, config.time_limit)
+    # 複数負荷率パターンで最適化実行
+    output_base = Path(config.output_dir)
+    results_summary = []
+    all_output_files = []
 
-    if result.status not in ('OPTIMAL', 'FEASIBLE'):
-        print(f"\nエラー: 最適化に失敗しました - ステータス: {result.status}")
-        return 1
+    for rate in LOAD_RATE_PATTERNS:
+        pct_label = f"{int(rate * 100)}pct"
+        pattern_dir = output_base / pct_label
 
-    # 結果出力
-    print("\n【結果出力】")
-    output_dir = Path(config.output_dir)
-    generate_all_outputs(result, capacities)
-    excel_path = export_to_excel(result, specs, capacities, str(output_dir / 'optimization_result.xlsx'))
+        print(f"\n{'=' * 60}")
+        print(f"【最適化実行】負荷率上限: {int(rate * 100)}%")
+        print(f"{'=' * 60}")
 
-    # 出力ファイル一覧
-    output_files = [
-        str(Path(config.output_dir) / 'optimization_result.xlsx'),
-        str(Path(config.output_dir) / 'optimization_report.txt'),
-        str(Path(config.output_dir) / 'line_loads.png'),
-        str(Path(config.output_dir) / 'load_summary.png'),
-    ]
+        result = optimize(specs, demands, capacities, config.time_limit, load_rate_limit=rate)
 
-    # Google Drive / メール送信
+        if result.status not in ('OPTIMAL', 'FEASIBLE'):
+            print(f"  エラー: 最適化に失敗しました - ステータス: {result.status}")
+            results_summary.append((rate, pct_label, result.status, None, None, None))
+            continue
+
+        # 結果サマリーを収集
+        total_load = sum(sum(loads) for loads in result.line_loads.values())
+        total_cap = sum(capacities.get(line, 0) for line in DISC_LINES) * 12
+        avg_rate_pct = total_load / total_cap * 100 if total_cap > 0 else 0
+        total_unmet = sum(sum(u) for u in result.unmet_demand.values()) if result.unmet_demand else 0
+        results_summary.append((rate, pct_label, result.status, result.solve_time, avg_rate_pct, total_unmet))
+
+        # 結果出力
+        pattern_dir.mkdir(parents=True, exist_ok=True)
+        generate_all_outputs(result, capacities, output_dir=str(pattern_dir))
+        export_to_excel(result, specs, capacities, str(pattern_dir / 'optimization_result.xlsx'))
+
+        all_output_files.extend([
+            str(pattern_dir / 'optimization_result.xlsx'),
+            str(pattern_dir / 'optimization_report.txt'),
+            str(pattern_dir / 'line_loads.png'),
+            str(pattern_dir / 'load_summary.png'),
+        ])
+
+    # パターン比較サマリー
+    print(f"\n{'=' * 60}")
+    print("【パターン比較サマリー】")
+    print(f"{'=' * 60}")
+    print(f"{'負荷率上限':>12} {'ステータス':>10} {'実行時間':>10} {'平均負荷率':>10} {'未割当合計':>10}")
+    print("-" * 56)
+    for rate, label, status, solve_time, avg_r, unmet in results_summary:
+        time_str = f"{solve_time:.2f}s" if solve_time is not None else "-"
+        avg_str = f"{avg_r:.1f}%" if avg_r is not None else "-"
+        unmet_str = f"{unmet:,}" if unmet is not None else "-"
+        print(f"{int(rate * 100)}% ({label}){status:>10} {time_str:>10} {avg_str:>10} {unmet_str:>10}")
+
+    # Google Drive / メール送信（最初の成功結果のレポートを使用）
     if config.output_to_gdrive or config.send_email:
-        # レポートテキストを生成
-        report_text = generate_text_report(result, capacities)
+        # 100%パターンのレポートを基にメール本文を作成
+        first_success = next(
+            ((r, l) for r, l, s, *_ in results_summary if s in ('OPTIMAL', 'FEASIBLE')),
+            None,
+        )
+        if first_success:
+            report_path = output_base / f"{first_success[1]}" / 'optimization_report.txt'
+            report_text = report_path.read_text(encoding='utf-8') if report_path.exists() else ""
+        else:
+            report_text = "全パターンで最適化に失敗しました。"
 
         email_body = create_result_email_body(
-            status=result.status,
-            objective_value=result.objective_value,
-            solve_time=result.solve_time,
-            summary=report_text[:2000],  # 長すぎる場合は切り詰め
+            status=results_summary[0][2] if results_summary else "UNKNOWN",
+            objective_value=None,
+            solve_time=0,
+            summary=report_text[:2000],
         )
 
         process_outputs(
-            files=output_files,
+            files=all_output_files,
             output_to_gdrive=config.output_to_gdrive,
             gdrive_folder_id=config.gdrive_folder_id,
             send_email_flag=config.send_email,
@@ -312,24 +353,53 @@ def main() -> int:
         print(f"エラー: 能力設定の読み込みに失敗しました - {e}")
         return 1
 
-    # 最適化実行
-    print("\n【最適化実行】")
-    result = optimize(specs, demands, capacities, args.time_limit)
+    # 複数負荷率パターンで最適化実行
+    output_base = Path(args.output_dir)
+    results_summary = []
 
-    if result.status not in ('OPTIMAL', 'FEASIBLE'):
-        print(f"\nエラー: 最適化に失敗しました - ステータス: {result.status}")
-        return 1
+    for rate in LOAD_RATE_PATTERNS:
+        pct_label = f"{int(rate * 100)}pct"
+        pattern_dir = output_base / pct_label
 
-    # 結果出力
-    if not args.no_visualize:
-        generate_all_outputs(result, capacities)
-        # Excel出力
-        export_to_excel(result, specs, capacities)
-    else:
-        print("\n【最適化完了】")
-        print(f"  ステータス: {result.status}")
-        print(f"  目的関数値: {result.objective_value:,.0f}")
-        print(f"  実行時間: {result.solve_time:.2f}秒")
+        print(f"\n{'=' * 60}")
+        print(f"【最適化実行】負荷率上限: {int(rate * 100)}%")
+        print(f"{'=' * 60}")
+
+        result = optimize(specs, demands, capacities, args.time_limit, load_rate_limit=rate)
+
+        if result.status not in ('OPTIMAL', 'FEASIBLE'):
+            print(f"  エラー: 最適化に失敗しました - ステータス: {result.status}")
+            results_summary.append((rate, pct_label, result.status, None, None, None))
+            continue
+
+        # 結果サマリーを収集
+        total_load = sum(sum(loads) for loads in result.line_loads.values())
+        total_cap = sum(capacities.get(line, 0) for line in DISC_LINES) * 12
+        avg_rate_pct = total_load / total_cap * 100 if total_cap > 0 else 0
+        total_unmet = sum(sum(u) for u in result.unmet_demand.values()) if result.unmet_demand else 0
+        results_summary.append((rate, pct_label, result.status, result.solve_time, avg_rate_pct, total_unmet))
+
+        # 結果出力
+        if not args.no_visualize:
+            pattern_dir.mkdir(parents=True, exist_ok=True)
+            generate_all_outputs(result, capacities, output_dir=str(pattern_dir))
+            export_to_excel(result, specs, capacities, str(pattern_dir / 'optimization_result.xlsx'))
+        else:
+            print(f"\n  ステータス: {result.status}")
+            print(f"  目的関数値: {result.objective_value:,.0f}")
+            print(f"  実行時間: {result.solve_time:.2f}秒")
+
+    # パターン比較サマリー
+    print(f"\n{'=' * 60}")
+    print("【パターン比較サマリー】")
+    print(f"{'=' * 60}")
+    print(f"{'負荷率上限':>12} {'ステータス':>10} {'実行時間':>10} {'平均負荷率':>10} {'未割当合計':>10}")
+    print("-" * 56)
+    for rate, label, status, solve_time, avg_r, unmet in results_summary:
+        time_str = f"{solve_time:.2f}s" if solve_time is not None else "-"
+        avg_str = f"{avg_r:.1f}%" if avg_r is not None else "-"
+        unmet_str = f"{unmet:,}" if unmet is not None else "-"
+        print(f"{int(rate * 100)}% ({label}){status:>10} {time_str:>10} {avg_str:>10} {unmet_str:>10}")
 
     print("\n完了しました。")
     return 0

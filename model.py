@@ -39,10 +39,12 @@ class LineOptimizer:
         demands: dict[str, PartDemand],
         capacities: dict[str, int | list[int]] | None = None,
         time_limit: int = DEFAULT_TIME_LIMIT_SECONDS,
+        load_rate_limit: float = 1.0,
     ):
         self.specs = specs
         self.demands = demands
         self.time_limit = time_limit
+        self.load_rate_limit = load_rate_limit
 
         # 月別能力に正規化: {ライン: [12ヶ月分の能力]}
         self.capacities = self._normalize_capacities(capacities or DEFAULT_CAPACITIES.copy())
@@ -159,11 +161,11 @@ class LineOptimizer:
                         sum(prod_vars) + self.unmet_demand[part_num, month] == month_demand
                     )
 
-        # 制約2: ライン能力制約（ハード制約：100%上限、オーバーフロー禁止）
+        # 制約2: ライン能力制約（ハード制約：負荷率上限、オーバーフロー禁止）
         for line in DISC_LINES:
             for month in range(12):
-                # 月別の能力を取得
-                capacity = self.get_capacity(line, month)
+                # 月別の能力を取得し、負荷率上限を適用
+                capacity = int(self.get_capacity(line, month) * self.load_rate_limit)
 
                 # このラインの月間総生産量
                 line_prod = []
@@ -172,7 +174,7 @@ class LineOptimizer:
                         line_prod.append(self.x[part_num, line, month])
 
                 if line_prod:
-                    # 生産量 <= 能力（ハード制約：オーバーフロー禁止）
+                    # 生産量 <= 能力×負荷率上限（ハード制約：オーバーフロー禁止）
                     self.model.Add(sum(line_prod) <= capacity)
 
         # 制約3: メインライン優先（サブラインはメインが能力超過の場合のみ）
@@ -371,6 +373,7 @@ def optimize(
     demands: dict[str, PartDemand],
     capacities: dict[str, int | list[int]] | None = None,
     time_limit: int = DEFAULT_TIME_LIMIT_SECONDS,
+    load_rate_limit: float = 1.0,
 ) -> OptimizationResult:
     """
     最適化を実行するヘルパー関数
@@ -380,11 +383,12 @@ def optimize(
         demands: 部品需要辞書
         capacities: ライン能力辞書（オプション）
         time_limit: ソルバー制限時間（秒）
+        load_rate_limit: 負荷率上限（0.0〜1.0、デフォルト1.0=100%）
 
     Returns:
         OptimizationResult
     """
-    optimizer = LineOptimizer(specs, demands, capacities, time_limit)
+    optimizer = LineOptimizer(specs, demands, capacities, time_limit, load_rate_limit)
     optimizer.build_model()
     return optimizer.solve()
 

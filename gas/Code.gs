@@ -28,7 +28,9 @@ function log(message, data = null) {
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('ライン最適化')
-    .addItem('最適化を実行', 'runOptimization')
+    .addItem('最適化を実行（100%）', 'runOptimization')
+    .addItem('パターン比較（100/90/80%）', 'runComparisonOptimization')
+    .addSeparator()
     .addItem('テンプレートを作成', 'createTemplateSheets')
     .addItem('サンプルデータを入力', 'insertSampleData')
     .addSeparator()
@@ -397,6 +399,252 @@ function writeResults(ss, response) {
 }
 
 // ========================================
+// パターン比較最適化（100%/90%/80%）
+// ========================================
+function runComparisonOptimization() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+
+  log('パターン比較最適化実行開始');
+
+  // 入力データ取得
+  const inputSheet = ss.getSheetByName('入力');
+  if (!inputSheet) {
+    ui.alert('エラー', '「入力」シートが見つかりません', ui.ButtonSet.OK);
+    return;
+  }
+
+  const inputData = inputSheet.getDataRange().getValues();
+  if (inputData.length < 2) {
+    ui.alert('エラー', '入力データがありません', ui.ButtonSet.OK);
+    return;
+  }
+
+  // 能力データ取得
+  const capSheet = ss.getSheetByName('ライン能力');
+  let capacitiesData = null;
+  if (capSheet) {
+    capacitiesData = capSheet.getDataRange().getValues().slice(1);
+  }
+
+  try {
+    log('比較API呼び出し開始');
+
+    const response = callCompareApi(inputData, capacitiesData);
+
+    log('比較API呼び出し完了', { success: response.success, patterns: response.patterns });
+
+    if (!response.success) {
+      ui.alert('最適化失敗', '全パターンで最適化に失敗しました', ui.ButtonSet.OK);
+      return;
+    }
+
+    // 比較結果を書き込み
+    writeComparisonResults(ss, response);
+
+    ui.alert('完了',
+      `パターン比較最適化が完了しました\n\n` +
+      `パターン: ${response.patterns.map(p => p + '%').join(', ')}\n` +
+      `部品数: ${response.parts_count}\n` +
+      `年間総需要: ${response.total_demand.toLocaleString()}\n\n` +
+      `結果シートを確認してください。`,
+      ui.ButtonSet.OK
+    );
+
+  } catch (error) {
+    log('エラー発生', { message: error.message, stack: error.stack });
+    ui.alert('エラー', `API呼び出しに失敗しました:\n${error.message}`, ui.ButtonSet.OK);
+  }
+}
+
+// ========================================
+// 比較API呼び出し
+// ========================================
+function callCompareApi(partsData, capacitiesData) {
+  const payload = {
+    parts_data: partsData,
+    capacities_data: capacitiesData,
+    time_limit: 60
+  };
+
+  log('比較APIリクエスト送信', { endpoint: '/optimize/simple/compare' });
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(`${API_URL}/optimize/simple/compare`, options);
+  const responseCode = response.getResponseCode();
+  const responseText = response.getContentText();
+
+  log('比較APIレスポンス受信', { code: responseCode, length: responseText.length });
+
+  if (responseCode !== 200) {
+    throw new Error(`HTTPエラー: ${responseCode}\n${responseText.substring(0, 200)}`);
+  }
+
+  return JSON.parse(responseText);
+}
+
+// ========================================
+// 比較結果書き込み
+// ========================================
+function writeComparisonResults(ss, response) {
+  const patterns = response.patterns; // [100, 90, 80]
+
+  // --- パターン比較サマリーシート ---
+  writeSheetData(ss, '結果_パターン比較', response.comparison_summary, {
+    headerBg: '#4472C4',
+    numberCols: [3, 4, 6],  // 目的関数値、実行時間、未割当合計
+  });
+
+  // --- ライン別負荷率比較シート ---
+  writeSheetData(ss, '結果_負荷率比較', response.line_comparison, {
+    headerBg: '#4472C4',
+    numberCols: [2],  // 平均能力
+  });
+
+  // --- 未割当比較シート ---
+  if (response.unmet_comparison && response.unmet_comparison.length > 1) {
+    writeSheetData(ss, '結果_未割当比較', response.unmet_comparison, {
+      headerBg: '#4472C4',
+      numberCols: Array.from({length: patterns.length}, (_, i) => i + 2),
+      warnRows: true,
+    });
+  }
+
+  // --- パターン別ライン負荷シート ---
+  for (const pct of patterns) {
+    const key = `${pct}pct`;
+    const sheetName = `結果_負荷_${pct}%`;
+    const data = response.patterns_line_loads[key];
+    if (data && data.length > 0) {
+      writeSheetData(ss, sheetName, data, {
+        headerBg: getPatternColor(pct),
+        numberStartCol: 2,
+        numberEndCol: 13,
+      });
+    }
+  }
+
+  // --- パターン別部品割当シート ---
+  for (const pct of patterns) {
+    const key = `${pct}pct`;
+    const sheetName = `結果_割当_${pct}%`;
+    const data = response.patterns_allocations[key];
+    if (data && data.length > 0) {
+      writeSheetData(ss, sheetName, data, {
+        headerBg: getPatternColor(pct),
+        numberStartCol: 3,
+        numberEndCol: 15,
+      });
+    }
+  }
+
+  // --- パターン別未割当シート ---
+  for (const pct of patterns) {
+    const key = `${pct}pct`;
+    const sheetName = `結果_未割当_${pct}%`;
+    const data = response.patterns_unmet[key];
+    if (data && data.length > 1) {
+      writeSheetData(ss, sheetName, data, {
+        headerBg: getPatternColor(pct),
+        numberStartCol: 2,
+        numberEndCol: 14,
+        warnRows: true,
+      });
+    }
+  }
+
+  // --- キャパシティシート（共通） ---
+  writeSheetData(ss, '結果_月別能力', response.capacities, {
+    headerBg: '#4472C4',
+    numberStartCol: 2,
+    numberEndCol: 13,
+  });
+
+  log('比較結果書き込み完了');
+}
+
+/**
+ * シートにデータを書き込む汎用関数
+ */
+function writeSheetData(ss, sheetName, data, options) {
+  if (!data || data.length === 0) return;
+
+  let sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+  }
+  sheet.clear();
+
+  // データ書き込み
+  const numCols = Math.max(...data.map(row => row.length));
+  // 行の列数を揃える
+  const normalizedData = data.map(row => {
+    const padded = [...row];
+    while (padded.length < numCols) padded.push('');
+    return padded;
+  });
+
+  sheet.getRange(1, 1, normalizedData.length, numCols).setValues(normalizedData);
+
+  // ヘッダースタイル
+  const headerBg = options.headerBg || '#4472C4';
+  sheet.getRange(1, 1, 1, numCols)
+    .setBackground(headerBg)
+    .setFontColor('white')
+    .setFontWeight('bold');
+
+  // 数値フォーマット（範囲指定）
+  if (options.numberStartCol && options.numberEndCol && normalizedData.length > 1) {
+    const startCol = options.numberStartCol;
+    const endCol = Math.min(options.numberEndCol, numCols);
+    sheet.getRange(2, startCol, normalizedData.length - 1, endCol - startCol + 1)
+      .setNumberFormat('#,##0');
+  }
+
+  // 特定列の数値フォーマット
+  if (options.numberCols && normalizedData.length > 1) {
+    for (const col of options.numberCols) {
+      if (col <= numCols) {
+        sheet.getRange(2, col, normalizedData.length - 1, 1)
+          .setNumberFormat('#,##0');
+      }
+    }
+  }
+
+  // 未割当行の警告色
+  if (options.warnRows && normalizedData.length > 1) {
+    for (let i = 2; i <= normalizedData.length; i++) {
+      // データ行に値がある場合は警告色
+      const rowData = normalizedData[i - 1];
+      const hasValue = rowData.slice(1).some(v => v !== '' && v !== 0 && v > 0);
+      if (hasValue) {
+        sheet.getRange(i, 1, 1, numCols).setBackground('#FFC7CE');
+      }
+    }
+  }
+
+  log(`${sheetName} 書き込み完了`, { rows: normalizedData.length });
+}
+
+/**
+ * パターンごとのヘッダー色を取得
+ */
+function getPatternColor(pct) {
+  const colors = {
+    100: '#4472C4',  // 青
+    90: '#ED7D31',   // オレンジ
+    80: '#70AD47',   // 緑
+  };
+  return colors[pct] || '#4472C4';
+}
+
+// ========================================
 // ヘルプ
 // ========================================
 function showHelp() {
@@ -409,20 +657,27 @@ KIRIU ライン負荷最適化システム
    - 部品番号、メインライン、サブライン、月別需要
 3. 「ライン能力」シートで月別の能力を調整
    - 各月ごとに異なる能力を設定可能
-4. メニュー「ライン最適化」→「最適化を実行」
+4. メニュー「ライン最適化」から実行方法を選択:
+   - 「最適化を実行（100%）」: 従来の単一パターン実行
+   - 「パターン比較（100/90/80%）」: 3パターン比較実行
 5. 結果シートで確認
 
-【シート構成】
-- 入力: 部品データ入力
-- ライン能力: 月別生産能力の設定（黄色セルを編集）
+【シート構成 - 単一パターン実行時】
 - 結果_ライン負荷: ライン別月別負荷
 - 結果_部品割当: 部品別生産割当
 - 結果_未割当: 能力超過で生産できなかった数量
-- 結果_月別能力: 最適化に使用した月別能力
+
+【シート構成 - パターン比較実行時】
+- 結果_パターン比較: 3パターンの概要比較
+- 結果_負荷率比較: ライン別負荷率の3パターン比較
+- 結果_未割当比較: 未割当数量の3パターン比較
+- 結果_負荷_100%/90%/80%: 各パターンのライン負荷詳細
+- 結果_割当_100%/90%/80%: 各パターンの部品割当詳細
+- 結果_未割当_100%/90%/80%: 各パターンの未割当詳細
 
 【重要】
-- 負荷率は100%を超えません（ハード制約）
-- 超過分は「結果_未割当」シートに表示されます
+- 負荷率は設定上限を超えません（ハード制約）
+- 上限を下げると未割当が増える場合があります
 
 【ログ確認方法】
 Apps Script エディタ → 表示 → 実行ログ
