@@ -6,6 +6,8 @@ KIRIU ライン負荷最適化システム - メインエントリーポイン�
     python main.py                              # デフォルト設定で実行
     python main.py --template input.xlsx        # テンプレートから設定を読み込んで実行
     python main.py --generate-template          # 入力テンプレートを生成
+    python main.py --spreadsheet                # Google Spreadsheetから読み書き
+    python main.py --setup-sheets               # Spreadsheetにテンプレートをセットアップ
     python main.py --capacities caps.json       # カスタム能力値を使用
     python main.py --time-limit 600             # ソルバー制限時間を600秒に設定
     python main.py --output-dir ./results       # 出力先ディレクトリを指定
@@ -18,6 +20,7 @@ from pathlib import Path
 
 from config import (
     DEFAULT_CAPACITIES,
+    DEFAULT_SPREADSHEET_ID,
     DEFAULT_TIME_LIMIT_SECONDS,
     DISC_LINES,
     OUTPUT_DIR,
@@ -60,6 +63,23 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default='input_template.xlsx',
         help='生成するテンプレートのファイル名 (デフォルト: input_template.xlsx)',
+    )
+
+    # Google Spreadsheet 連携
+    parser.add_argument(
+        '--spreadsheet',
+        nargs='?',
+        const=DEFAULT_SPREADSHEET_ID,
+        default=None,
+        help=f'Google Spreadsheetから読み書き (デフォルトID: {DEFAULT_SPREADSHEET_ID})',
+    )
+
+    parser.add_argument(
+        '--setup-sheets',
+        nargs='?',
+        const=DEFAULT_SPREADSHEET_ID,
+        default=None,
+        help=f'Spreadsheetにテンプレートをセットアップ (デフォルトID: {DEFAULT_SPREADSHEET_ID})',
     )
 
     # 入力ファイル設定
@@ -290,9 +310,108 @@ def run_with_template(template_path: str) -> int:
     return 0
 
 
+def run_with_spreadsheet(spreadsheet_id: str, time_limit: int = DEFAULT_TIME_LIMIT_SECONDS) -> int:
+    """Google Spreadsheetから読み書きして最適化を実行"""
+    from sheets_io import read_input_sheet, read_line_capacities, write_results
+    from data_loader import merge_data
+
+    print("=" * 60)
+    print("KIRIU ライン負荷最適化システム (Google Spreadsheet モード)")
+    print("=" * 60)
+    print()
+    print(f"スプレッドシートID: {spreadsheet_id}")
+    print(f"URL: https://docs.google.com/spreadsheets/d/{spreadsheet_id}")
+    print()
+
+    # 入力シートから部品データ読み込み
+    try:
+        print("【入力シート読み込み】")
+        specs, demands = read_input_sheet(spreadsheet_id)
+
+        if not specs or not demands:
+            print("エラー: 入力シートに有効なデータがありません")
+            return 1
+
+    except Exception as e:
+        print(f"エラー: 入力シートの読み込みに失敗しました - {e}")
+        raise
+
+    # ライン能力読み込み
+    try:
+        print("\n【ライン能力読み込み】")
+        capacities = read_line_capacities(spreadsheet_id)
+    except Exception as e:
+        print(f"エラー: ライン能力の読み込みに失敗しました - {e}")
+        raise
+
+    print(f"\n  部品数: {len(specs)}")
+    print(f"  総需要: {sum(sum(d.monthly_demand) for d in demands.values()):,}")
+
+    # 複数負荷率パターンで最適化実行
+    results_summary = []
+
+    for rate in LOAD_RATE_PATTERNS:
+        pct_label = f"{int(rate * 100)}pct"
+        sheet_suffix = f"_{pct_label}"
+
+        print(f"\n{'=' * 60}")
+        print(f"【最適化実行】負荷率上限: {int(rate * 100)}%")
+        print(f"{'=' * 60}")
+
+        # optimize() にはスカラー能力を渡す（月別能力はモデル内で処理）
+        result = optimize(specs, demands, capacities, time_limit, load_rate_limit=rate)
+
+        if result.status not in ('OPTIMAL', 'FEASIBLE'):
+            print(f"  エラー: 最適化に失敗しました - ステータス: {result.status}")
+            results_summary.append((rate, pct_label, result.status, None, None, None))
+            continue
+
+        # 結果サマリーを収集
+        total_load = sum(sum(loads) for loads in result.line_loads.values())
+        total_cap = sum(sum(capacities.get(line, [0] * 12)) for line in DISC_LINES)
+        avg_rate_pct = total_load / total_cap * 100 if total_cap > 0 else 0
+        total_unmet = sum(sum(u) for u in result.unmet_demand.values()) if result.unmet_demand else 0
+        results_summary.append((rate, pct_label, result.status, result.solve_time, avg_rate_pct, total_unmet))
+
+        # 結果をスプレッドシートに書き込み
+        try:
+            print(f"\n  結果をスプレッドシートに書き込み中...")
+            write_results(spreadsheet_id, result, specs, capacities, sheet_suffix)
+        except Exception as e:
+            print(f"  警告: 結果の書き込みに失敗しました - {e}")
+
+    # パターン比較サマリー
+    print(f"\n{'=' * 60}")
+    print("【パターン比較サマリー】")
+    print(f"{'=' * 60}")
+    print(f"{'負荷率上限':>12} {'ステータス':>10} {'実行時間':>10} {'平均負荷率':>10} {'未割当合計':>10}")
+    print("-" * 56)
+    for rate, label, status, solve_time, avg_r, unmet in results_summary:
+        time_str = f"{solve_time:.2f}s" if solve_time is not None else "-"
+        avg_str = f"{avg_r:.1f}%" if avg_r is not None else "-"
+        unmet_str = f"{unmet:,}" if unmet is not None else "-"
+        print(f"{int(rate * 100)}% ({label}){status:>10} {time_str:>10} {avg_str:>10} {unmet_str:>10}")
+
+    print(f"\n結果は以下のスプレッドシートに書き込まれました:")
+    print(f"  https://docs.google.com/spreadsheets/d/{spreadsheet_id}")
+    print("\n完了しました。")
+    return 0
+
+
 def main() -> int:
     """メイン処理"""
     args = parse_args()
+
+    # スプレッドシート テンプレートセットアップモード
+    if args.setup_sheets:
+        from sheets_io import setup_template
+        print("Google Spreadsheetにテンプレートをセットアップします...")
+        setup_template(args.setup_sheets)
+        return 0
+
+    # スプレッドシートモード
+    if args.spreadsheet:
+        return run_with_spreadsheet(args.spreadsheet, args.time_limit)
 
     # テンプレート生成モード
     if args.generate_template:

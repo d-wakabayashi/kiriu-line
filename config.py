@@ -37,3 +37,6 @@ PLAN_SHEET = '赤堀分工場2029上期'
 
 # 出力ディレクトリ
 OUTPUT_DIR = '/home/user/kiriu-line/output'
+
+# Google Spreadsheet ID
+DEFAULT_SPREADSHEET_ID = '1xBDJkTcQmR0vzuupD36slF8TziTc3EiNzLvArCIMBRM'

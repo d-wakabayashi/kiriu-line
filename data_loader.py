@@ -242,6 +242,9 @@ def load_production_plan(
     plan_infos = {}  # 生産計画から取得したライン情報
     disc_keywords = ['ディスク', 'ﾃﾞｨｽｸ', '5:ディスク', '5：ディスク', '5:ﾃﾞｨｽｸ']
 
+    # 合算トラッキング: {part_num: [(main_line, row_index), ...]}
+    row_tracking = {}
+
     for idx, row in df.iterrows():
         if idx <= header_row:
             continue
@@ -307,7 +310,12 @@ def load_production_plan(
 
         # 需要がゼロでない場合のみ追加
         if sum(monthly) > 0:
-            # 同一部品番号が複数行ある場合は合算
+            # 行トラッキング
+            if part_num not in row_tracking:
+                row_tracking[part_num] = []
+            row_tracking[part_num].append((main_line, idx + 1))  # 1-indexed row number
+
+            # 同一部品番号が複数行ある場合は需要を合算（一行にまとめる）
             if part_num in demands:
                 existing = demands[part_num]
                 for i in range(12):
@@ -318,6 +326,17 @@ def load_production_plan(
                     part_name=part_name,
                     monthly_demand=monthly,
                 )
+
+    # 合算された部品を表示
+    consolidated = {pn: entries for pn, entries in row_tracking.items() if len(entries) > 1}
+    if consolidated:
+        print(f"  同一部品番号の複数行を合算: {len(consolidated)}件")
+        for pn, entries in sorted(consolidated.items()):
+            lines = set(e[0] for e in entries)
+            line_str = ', '.join(sorted(lines))
+            row_nums = ', '.join(str(e[1]) for e in entries)
+            total = sum(demands[pn].monthly_demand)
+            print(f"    {pn} (ライン: {line_str}): {len(entries)}行(行{row_nums}) → 合算後年間需要 {total:,}")
 
     print(f"  読み込み部品数: {len(demands)}")
     total_demand = sum(sum(d.monthly_demand) for d in demands.values())
