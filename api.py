@@ -257,7 +257,10 @@ class SimpleOptimizeRequest(BaseModel):
 
 
 def _parse_simple_request(request: SimpleOptimizeRequest):
-    """シンプル版リクエストからspecs, demands, capacitiesを抽出する共通ヘルパー"""
+    """シンプル版リクエストからspecs, demands, capacitiesを抽出する共通ヘルパー
+
+    同一部品番号・同一ラインの行が複数ある場合は需要量を合算する。
+    """
     specs = {}
     demands = {}
 
@@ -287,19 +290,27 @@ def _parse_simple_request(request: SimpleOptimizeRequest):
         if sum(monthly) == 0:
             continue
 
-        specs[part_num] = PartSpec(
-            part_number=part_num,
-            part_name='',
-            main_line=main_line,
-            sub1_line=sub1_line if sub1_line in DISC_LINES else None,
-            sub2_line=sub2_line if sub2_line in DISC_LINES else None,
-        )
+        # 仕様を登録（最初に見つかったものを使用）
+        if part_num not in specs:
+            specs[part_num] = PartSpec(
+                part_number=part_num,
+                part_name='',
+                main_line=main_line,
+                sub1_line=sub1_line if sub1_line in DISC_LINES else None,
+                sub2_line=sub2_line if sub2_line in DISC_LINES else None,
+            )
 
-        demands[part_num] = PartDemand(
-            part_number=part_num,
-            part_name='',
-            monthly_demand=monthly,
-        )
+        # 同一部品番号の複数行は需要を合算
+        if part_num in demands:
+            existing = demands[part_num]
+            for i in range(12):
+                existing.monthly_demand[i] += monthly[i]
+        else:
+            demands[part_num] = PartDemand(
+                part_number=part_num,
+                part_name='',
+                monthly_demand=monthly,
+            )
 
     if not specs:
         raise HTTPException(status_code=400, detail="有効な部品データがありません")
