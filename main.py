@@ -312,7 +312,11 @@ def run_with_template(template_path: str) -> int:
 
 def run_with_spreadsheet(spreadsheet_id: str, time_limit: int = DEFAULT_TIME_LIMIT_SECONDS) -> int:
     """Google Spreadsheetから読み書きして最適化を実行"""
-    from sheets_io import read_input_sheet, read_line_capacities, write_results
+    from sheets_io import (
+        read_input_sheet, read_line_capacities, write_results,
+        has_work_pattern_sheets, read_work_patterns, read_line_jph, read_monthly_working_days,
+    )
+    from config import calculate_monthly_capacities
     from data_loader import merge_data
 
     print("=" * 60)
@@ -336,6 +340,106 @@ def run_with_spreadsheet(spreadsheet_id: str, time_limit: int = DEFAULT_TIME_LIM
         print(f"エラー: 入力シートの読み込みに失敗しました - {e}")
         raise
 
+    print(f"\n  部品数: {len(specs)}")
+    print(f"  総需要: {sum(sum(d.monthly_demand) for d in demands.values()):,}")
+
+    # 新シートがあるか確認 → 勤務体制パターン方式 / 旧方式フォールバック
+    use_work_patterns = False
+    try:
+        use_work_patterns = has_work_pattern_sheets(spreadsheet_id)
+    except Exception:
+        pass
+
+    if use_work_patterns:
+        return _run_spreadsheet_work_patterns(spreadsheet_id, specs, demands, time_limit)
+    else:
+        print("\n※ 勤務体制パターンシートが未設定のため、旧方式（負荷率パターン）で実行します。")
+        return _run_spreadsheet_load_rate(spreadsheet_id, specs, demands, time_limit)
+
+
+def _run_spreadsheet_work_patterns(spreadsheet_id, specs, demands, time_limit):
+    """勤務体制パターン方式でSpreadsheet最適化を実行"""
+    from sheets_io import read_work_patterns, read_line_jph, read_monthly_working_days, write_results
+    from config import calculate_monthly_capacities
+
+    # 新シート3枚を読み込み
+    try:
+        print("\n【勤務体制パターン読み込み】")
+        work_patterns = read_work_patterns(spreadsheet_id)
+        jph = read_line_jph(spreadsheet_id)
+        working_days = read_monthly_working_days(spreadsheet_id)
+    except Exception as e:
+        print(f"エラー: 勤務体制パターンの読み込みに失敗しました - {e}")
+        raise
+
+    # パターン別の月別能力を計算
+    pattern_capacities = calculate_monthly_capacities(jph, work_patterns, working_days)
+
+    print("\n【パターン別月間能力（平均）】")
+    for pattern_name, caps in pattern_capacities.items():
+        print(f"  {pattern_name}:")
+        for line in DISC_LINES:
+            avg = sum(caps[line]) // 12
+            print(f"    {line}: {avg:,}/月")
+
+    # 勤務体制パターンごとに最適化実行
+    results_summary = []
+
+    for pattern_name, capacities in pattern_capacities.items():
+        sheet_suffix = f"_{pattern_name}"
+
+        print(f"\n{'=' * 60}")
+        print(f"【最適化実行】勤務体制: {pattern_name}")
+        print(f"{'=' * 60}")
+
+        result = optimize(specs, demands, capacities, time_limit)
+
+        if result.status not in ('OPTIMAL', 'FEASIBLE'):
+            print(f"  エラー: 最適化に失敗しました - ステータス: {result.status}")
+            results_summary.append((pattern_name, result.status, None, None, None))
+            continue
+
+        # 結果サマリーを収集
+        total_load = sum(sum(loads) for loads in result.line_loads.values())
+        total_cap = sum(sum(capacities.get(line, [0] * 12)) for line in DISC_LINES)
+        avg_rate_pct = total_load / total_cap * 100 if total_cap > 0 else 0
+        total_unmet = sum(sum(u) for u in result.unmet_demand.values()) if result.unmet_demand else 0
+        results_summary.append((pattern_name, result.status, result.solve_time, avg_rate_pct, total_unmet))
+
+        # 結果をスプレッドシートに書き込み
+        try:
+            print(f"\n  結果をスプレッドシートに書き込み中...")
+            write_results(spreadsheet_id, result, specs, capacities, sheet_suffix)
+        except Exception as e:
+            print(f"  警告: 結果の書き込みに失敗しました - {e}")
+
+    # パターン比較サマリー
+    print(f"\n{'=' * 60}")
+    print("【勤務体制パターン比較サマリー】")
+    print(f"{'=' * 60}")
+    print(f"{'勤務体制':>14} {'ステータス':>10} {'実行時間':>10} {'平均負荷率':>10} {'未割当合計':>10}")
+    print("-" * 58)
+    for entry in results_summary:
+        name = entry[0]
+        status = entry[1]
+        solve_time = entry[2]
+        avg_r = entry[3]
+        unmet = entry[4]
+        time_str = f"{solve_time:.2f}s" if solve_time is not None else "-"
+        avg_str = f"{avg_r:.1f}%" if avg_r is not None else "-"
+        unmet_str = f"{unmet:,}" if unmet is not None else "-"
+        print(f"{name:>14} {status:>10} {time_str:>10} {avg_str:>10} {unmet_str:>10}")
+
+    print(f"\n結果は以下のスプレッドシートに書き込まれました:")
+    print(f"  https://docs.google.com/spreadsheets/d/{spreadsheet_id}")
+    print("\n完了しました。")
+    return 0
+
+
+def _run_spreadsheet_load_rate(spreadsheet_id, specs, demands, time_limit):
+    """旧方式（負荷率パターン）でSpreadsheet最適化を実行"""
+    from sheets_io import read_line_capacities, write_results
+
     # ライン能力読み込み
     try:
         print("\n【ライン能力読み込み】")
@@ -343,9 +447,6 @@ def run_with_spreadsheet(spreadsheet_id: str, time_limit: int = DEFAULT_TIME_LIM
     except Exception as e:
         print(f"エラー: ライン能力の読み込みに失敗しました - {e}")
         raise
-
-    print(f"\n  部品数: {len(specs)}")
-    print(f"  総需要: {sum(sum(d.monthly_demand) for d in demands.values()):,}")
 
     # 複数負荷率パターンで最適化実行
     results_summary = []
@@ -358,7 +459,6 @@ def run_with_spreadsheet(spreadsheet_id: str, time_limit: int = DEFAULT_TIME_LIM
         print(f"【最適化実行】負荷率上限: {int(rate * 100)}%")
         print(f"{'=' * 60}")
 
-        # optimize() にはスカラー能力を渡す（月別能力はモデル内で処理）
         result = optimize(specs, demands, capacities, time_limit, load_rate_limit=rate)
 
         if result.status not in ('OPTIMAL', 'FEASIBLE'):

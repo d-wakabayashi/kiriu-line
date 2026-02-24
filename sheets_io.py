@@ -6,14 +6,22 @@ gspread + google-auth-oauthlib で認証してスプレッドシートを読み�
 """
 
 import json
+import os
 from pathlib import Path
 
 import gspread
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+try:
+    from google_auth_oauthlib.flow import InstalledAppFlow
+except ImportError:
+    InstalledAppFlow = None  # Cloud Run環境ではoauthlibは不要
 
-from config import DISC_LINES, DEFAULT_CAPACITIES, MONTHS, DEFAULT_SPREADSHEET_ID
+from config import (
+    DISC_LINES, DEFAULT_CAPACITIES, MONTHS, DEFAULT_SPREADSHEET_ID,
+    DEFAULT_JPH, DEFAULT_WORK_PATTERNS, DEFAULT_MONTHLY_WORKING_DAYS,
+    WorkPattern,
+)
 from data_loader import PartSpec, PartDemand, normalize_part_number, normalize_line_name
 
 SCOPES = [
@@ -25,16 +33,28 @@ TOKEN_PATH = Path.home() / '.kiriu-line-token.json'
 
 INPUT_SHEET_NAME = '入力シート'
 LINE_CAPACITY_SHEET_NAME = 'ライン能力'
+WORK_PATTERN_SHEET_NAME = '負荷率計算'
+LINE_JPH_SHEET_NAME = 'ライン製造能力'
+WORKING_DAYS_SHEET_NAME = '月間稼働日数'
 
 
 def get_client() -> gspread.Client:
     """
-    OAuth2 認証して gspread クライアントを返す。
+    認証して gspread クライアントを返す。
 
-    1. ~/.kiriu-line-token.json にキャッシュがあれば再利用
-    2. なければ ~/.clasprc.json から client_id/secret を読み、認証フローを実行
-    3. トークンを ~/.kiriu-line-token.json に保存
+    Cloud Run環境（K_SERVICE環境変数あり）:
+        Application Default Credentials（サービスアカウント）を使用
+    ローカル環境:
+        1. ~/.kiriu-line-token.json にキャッシュがあれば再利用
+        2. なければ ~/.clasprc.json から client_id/secret を読み、認証フローを実行
+        3. トークンを ~/.kiriu-line-token.json に保存
     """
+    # Cloud Run 環境ではサービスアカウント認証を使用
+    if os.environ.get('K_SERVICE'):
+        import google.auth
+        creds, _ = google.auth.default(scopes=SCOPES)
+        return gspread.authorize(creds)
+
     creds = None
 
     # キャッシュされたトークンを試す
@@ -81,6 +101,12 @@ def get_client() -> gspread.Client:
                 'redirect_uris': ['http://localhost'],
             }
         }
+
+        if InstalledAppFlow is None:
+            raise RuntimeError(
+                'google-auth-oauthlib がインストールされていません。'
+                'ローカル環境では pip install google-auth-oauthlib を実行してください。'
+            )
 
         flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
 
@@ -260,6 +286,149 @@ def read_line_capacities(
     return capacities
 
 
+def read_work_patterns(
+    spreadsheet_id: str = DEFAULT_SPREADSHEET_ID,
+) -> list[WorkPattern]:
+    """
+    負荷率計算シートから勤務体制パターンを読み込む。
+
+    シート構造:
+    | 勤務体制 | 月稼働時間計算式 | 月除外時間 |
+
+    Returns:
+        WorkPatternのリスト
+    """
+    client = get_client()
+    sh = client.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(WORK_PATTERN_SHEET_NAME)
+
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        print('負荷率計算シートにデータがありません。デフォルト値を使用します。')
+        return list(DEFAULT_WORK_PATTERNS)
+
+    patterns: list[WorkPattern] = []
+    for row in rows[1:]:
+        if len(row) < 3:
+            continue
+        name = str(row[0]).strip()
+        formula = str(row[1]).strip()
+        if not name or not formula:
+            continue
+        try:
+            exclusion = float(str(row[2]).replace(',', '').strip()) if row[2] else 0
+        except (ValueError, TypeError):
+            exclusion = 0
+        patterns.append(WorkPattern(name=name, formula=formula, exclusion_hours=exclusion))
+
+    if not patterns:
+        print('負荷率計算シートに有効なパターンがありません。デフォルト値を使用します。')
+        return list(DEFAULT_WORK_PATTERNS)
+
+    print(f'勤務体制パターン読み込み: {len(patterns)}件')
+    for p in patterns:
+        print(f'  {p.name}: {p.formula} (除外時間: {p.exclusion_hours}h)')
+
+    return patterns
+
+
+def read_line_jph(
+    spreadsheet_id: str = DEFAULT_SPREADSHEET_ID,
+) -> dict[str, float]:
+    """
+    ライン製造能力シートからJPH（時間あたり生産数）を読み込む。
+
+    シート構造:
+    | ライン | JPH |
+
+    Returns:
+        {ライン名: JPH値}
+    """
+    client = get_client()
+    sh = client.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(LINE_JPH_SHEET_NAME)
+
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        print('ライン製造能力シートにデータがありません。デフォルト値を使用します。')
+        return dict(DEFAULT_JPH)
+
+    jph: dict[str, float] = {}
+    for row in rows[1:]:
+        if len(row) < 2:
+            continue
+        line_name = str(row[0]).strip()
+        if line_name not in DISC_LINES:
+            continue
+        try:
+            val = float(str(row[1]).replace(',', '').strip()) if row[1] else 0
+        except (ValueError, TypeError):
+            val = 0
+        jph[line_name] = val
+
+    # 不足ラインにデフォルト値を補完
+    for line in DISC_LINES:
+        if line not in jph:
+            jph[line] = DEFAULT_JPH.get(line, 0)
+
+    print('ライン製造能力（JPH）読み込み:')
+    for line in DISC_LINES:
+        print(f'  {line}: {jph[line]:.0f} JPH')
+
+    return jph
+
+
+def read_monthly_working_days(
+    spreadsheet_id: str = DEFAULT_SPREADSHEET_ID,
+) -> list[float]:
+    """
+    月間稼働日数シートから稼働日数を読み込む。
+
+    シート構造:
+    | 4月 | 5月 | 6月 | ... | 3月 |
+
+    Returns:
+        12ヶ月分の稼働日数リスト
+    """
+    client = get_client()
+    sh = client.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(WORKING_DAYS_SHEET_NAME)
+
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        print('月間稼働日数シートにデータがありません。デフォルト値を使用します。')
+        return list(DEFAULT_MONTHLY_WORKING_DAYS)
+
+    # データ行（ヘッダーの次の行）
+    data_row = rows[1]
+    days: list[float] = []
+    for i in range(min(12, len(data_row))):
+        try:
+            val = float(str(data_row[i]).replace(',', '').strip()) if data_row[i] else 20
+        except (ValueError, TypeError):
+            val = 20
+        days.append(val)
+
+    # 12ヶ月に足りない場合は20日で埋める
+    while len(days) < 12:
+        days.append(20)
+
+    print(f'月間稼働日数読み込み:')
+    for i, month in enumerate(MONTHS):
+        print(f'  {month}: {days[i]:.0f}日')
+
+    return days
+
+
+def has_work_pattern_sheets(spreadsheet_id: str = DEFAULT_SPREADSHEET_ID) -> bool:
+    """勤務体制パターン関連の新シート3枚が全て存在するか確認する。"""
+    client = get_client()
+    sh = client.open_by_key(spreadsheet_id)
+    sheet_names = [ws.title for ws in sh.worksheets()]
+    required = [WORK_PATTERN_SHEET_NAME, LINE_JPH_SHEET_NAME, WORKING_DAYS_SHEET_NAME]
+    return all(name in sheet_names for name in required)
+
+
 def setup_template(spreadsheet_id: str = DEFAULT_SPREADSHEET_ID) -> None:
     """
     スプレッドシートにテンプレート（ヘッダー行とデフォルトライン能力）をセットアップする。
@@ -294,6 +463,44 @@ def setup_template(spreadsheet_id: str = DEFAULT_SPREADSHEET_ID) -> None:
 
     ws_cap.update('A1', cap_data)
     print(f'ライン能力シートにデフォルト値を書き込みました: {LINE_CAPACITY_SHEET_NAME}')
+
+    # --- 負荷率計算シート ---
+    try:
+        ws_wp = sh.worksheet(WORK_PATTERN_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws_wp = sh.add_worksheet(title=WORK_PATTERN_SHEET_NAME, rows=20, cols=3)
+
+    wp_header = ['勤務体制', '月稼働時間計算式', '月除外時間']
+    wp_data = [wp_header]
+    for p in DEFAULT_WORK_PATTERNS:
+        wp_data.append([p.name, p.formula, p.exclusion_hours])
+
+    ws_wp.update('A1', wp_data)
+    print(f'負荷率計算シートにデフォルト値を書き込みました: {WORK_PATTERN_SHEET_NAME}')
+
+    # --- ライン製造能力シート ---
+    try:
+        ws_jph = sh.worksheet(LINE_JPH_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws_jph = sh.add_worksheet(title=LINE_JPH_SHEET_NAME, rows=20, cols=2)
+
+    jph_header = ['ライン', 'JPH']
+    jph_data = [jph_header]
+    for line in DISC_LINES:
+        jph_data.append([line, DEFAULT_JPH.get(line, 0)])
+
+    ws_jph.update('A1', jph_data)
+    print(f'ライン製造能力シートにデフォルト値を書き込みました: {LINE_JPH_SHEET_NAME}')
+
+    # --- 月間稼働日数シート ---
+    try:
+        ws_days = sh.worksheet(WORKING_DAYS_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws_days = sh.add_worksheet(title=WORKING_DAYS_SHEET_NAME, rows=5, cols=12)
+
+    days_data = [MONTHS, DEFAULT_MONTHLY_WORKING_DAYS]
+    ws_days.update('A1', days_data)
+    print(f'月間稼働日数シートにデフォルト値を書き込みました: {WORKING_DAYS_SHEET_NAME}')
 
     print('\nセットアップ完了。')
     print(f'スプレッドシート: https://docs.google.com/spreadsheets/d/{spreadsheet_id}')

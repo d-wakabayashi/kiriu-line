@@ -11,7 +11,13 @@ RUN pip install --no-cache-dir -r requirements.txt uvicorn fastapi
 COPY config.py .
 COPY data_loader.py .
 COPY model.py .
+COPY sheets_io.py .
 COPY api.py .
+COPY excel_output.py .
+COPY visualize.py .
+COPY main.py .
+COPY input_template.py .
+COPY output_handler.py .
 
 # ポート設定
 ENV PORT=8080

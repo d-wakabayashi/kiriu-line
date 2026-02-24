@@ -30,6 +30,7 @@ function onOpen() {
   ui.createMenu('ライン最適化')
     .addItem('最適化を実行（100%）', 'runOptimization')
     .addItem('パターン比較（100/90/80%）', 'runComparisonOptimization')
+    .addItem('勤務体制パターン比較', 'runWorkPatternComparison')
     .addSeparator()
     .addItem('テンプレートを作成', 'createTemplateSheets')
     .addItem('サンプルデータを入力', 'insertSampleData')
@@ -124,6 +125,69 @@ function createTemplateSheets() {
     resultCapSheet = ss.insertSheet('結果_月別能力');
   }
   resultCapSheet.clear();
+
+  // --- 勤務体制パターン関連シート ---
+
+  // 負荷率計算シート
+  let wpSheet = ss.getSheetByName('負荷率計算');
+  if (!wpSheet) {
+    wpSheet = ss.insertSheet('負荷率計算');
+  }
+  wpSheet.clear();
+
+  const wpHeaders = ['勤務体制', '月稼働時間計算式', '月除外時間'];
+  wpSheet.getRange(1, 1, 1, wpHeaders.length).setValues([wpHeaders]);
+  wpSheet.getRange(1, 1, 1, wpHeaders.length)
+    .setBackground('#4472C4')
+    .setFontColor('white')
+    .setFontWeight('bold');
+
+  const wpData = [
+    ['2直2交替', '{月間稼働日数} * 7.5 * 2 - {月除外時間}', 5],
+    ['3直3交替', '{月間稼働日数} * 7.5 * 3 - {月除外時間}', 8],
+  ];
+  wpSheet.getRange(2, 1, wpData.length, wpData[0].length).setValues(wpData);
+  wpSheet.getRange(2, 1, wpData.length, wpData[0].length).setBackground('#FFFFCC');
+
+  // ライン製造能力シート（JPH）
+  let jphSheet = ss.getSheetByName('ライン製造能力');
+  if (!jphSheet) {
+    jphSheet = ss.insertSheet('ライン製造能力');
+  }
+  jphSheet.clear();
+
+  const jphHeaders = ['ライン', 'JPH'];
+  jphSheet.getRange(1, 1, 1, jphHeaders.length).setValues([jphHeaders]);
+  jphSheet.getRange(1, 1, 1, jphHeaders.length)
+    .setBackground('#4472C4')
+    .setFontColor('white')
+    .setFontWeight('bold');
+
+  const defaultJph = {
+    '4915': 350, '4919': 400, '4927': 200, '4928': 200,
+    '4934': 250, '4935': 425, '4945': 250, '4G01': 250, '4J01': 50
+  };
+  const jphData = DISC_LINES.map(line => [line, defaultJph[line] || 0]);
+  jphSheet.getRange(2, 1, jphData.length, 2).setValues(jphData);
+  jphSheet.getRange(2, 2, jphData.length, 1).setNumberFormat('#,##0');
+  jphSheet.getRange(2, 2, jphData.length, 1).setBackground('#FFFFCC');
+
+  // 月間稼働日数シート
+  let daysSheet = ss.getSheetByName('月間稼働日数');
+  if (!daysSheet) {
+    daysSheet = ss.insertSheet('月間稼働日数');
+  }
+  daysSheet.clear();
+
+  daysSheet.getRange(1, 1, 1, MONTHS.length).setValues([MONTHS]);
+  daysSheet.getRange(1, 1, 1, MONTHS.length)
+    .setBackground('#4472C4')
+    .setFontColor('white')
+    .setFontWeight('bold');
+
+  const defaultDays = [[20, 19, 21, 22, 21, 20, 22, 19, 21, 20, 18, 21]];
+  daysSheet.getRange(2, 1, 1, 12).setValues(defaultDays);
+  daysSheet.getRange(2, 1, 1, 12).setBackground('#FFFFCC');
 
   log('テンプレート作成完了');
   SpreadsheetApp.getUi().alert('テンプレートシートを作成しました');
@@ -458,6 +522,238 @@ function runComparisonOptimization() {
 }
 
 // ========================================
+// 勤務体制パターン比較最適化
+// ========================================
+function runWorkPatternComparison() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+
+  log('勤務体制パターン比較実行開始');
+
+  // 入力データ取得
+  const inputSheet = ss.getSheetByName('入力');
+  if (!inputSheet) {
+    ui.alert('エラー', '「入力」シートが見つかりません', ui.ButtonSet.OK);
+    return;
+  }
+
+  const inputData = inputSheet.getDataRange().getValues();
+  if (inputData.length < 2) {
+    ui.alert('エラー', '入力データがありません', ui.ButtonSet.OK);
+    return;
+  }
+
+  // 勤務体制パターン関連シートの読み込み
+  const wpSheet = ss.getSheetByName('負荷率計算');
+  const jphSheet = ss.getSheetByName('ライン製造能力');
+  const daysSheet = ss.getSheetByName('月間稼働日数');
+
+  if (!wpSheet || !jphSheet || !daysSheet) {
+    ui.alert('エラー',
+      '勤務体制パターン関連シートが見つかりません。\n' +
+      'テンプレートを作成してデータを入力してください。\n\n' +
+      '必要なシート: 負荷率計算、ライン製造能力、月間稼働日数',
+      ui.ButtonSet.OK);
+    return;
+  }
+
+  // 勤務体制パターン読み込み
+  const wpData = wpSheet.getDataRange().getValues();
+  const workPatterns = [];
+  for (let i = 1; i < wpData.length; i++) {
+    const row = wpData[i];
+    if (row[0] && row[1]) {
+      workPatterns.push({
+        name: String(row[0]).trim(),
+        formula: String(row[1]).trim(),
+        exclusion_hours: parseFloat(row[2]) || 0
+      });
+    }
+  }
+
+  if (workPatterns.length === 0) {
+    ui.alert('エラー', '負荷率計算シートに有効なパターンがありません', ui.ButtonSet.OK);
+    return;
+  }
+
+  // JPHデータ読み込み
+  const jphData = jphSheet.getDataRange().getValues();
+
+  // 月間稼働日数読み込み
+  const daysData = daysSheet.getDataRange().getValues();
+  let monthlyDays = [];
+  if (daysData.length >= 2) {
+    monthlyDays = daysData[1].slice(0, 12).map(v => parseFloat(v) || 20);
+  }
+
+  try {
+    log('勤務体制パターンAPI呼び出し開始', { patterns: workPatterns.length });
+
+    const response = callWorkPatternApi(inputData, jphData, workPatterns, monthlyDays);
+
+    log('勤務体制パターンAPI呼び出し完了', {
+      success: response.success,
+      pattern_names: response.pattern_names
+    });
+
+    if (!response.success) {
+      ui.alert('最適化失敗', '全パターンで最適化に失敗しました', ui.ButtonSet.OK);
+      return;
+    }
+
+    // 結果を書き込み
+    writeWorkPatternResults(ss, response);
+
+    ui.alert('完了',
+      `勤務体制パターン比較最適化が完了しました\n\n` +
+      `パターン: ${response.pattern_names.join(', ')}\n` +
+      `部品数: ${response.parts_count}\n` +
+      `年間総需要: ${response.total_demand.toLocaleString()}\n\n` +
+      `結果シートを確認してください。`,
+      ui.ButtonSet.OK
+    );
+
+  } catch (error) {
+    log('エラー発生', { message: error.message, stack: error.stack });
+    ui.alert('エラー', `API呼び出しに失敗しました:\n${error.message}`, ui.ButtonSet.OK);
+  }
+}
+
+// ========================================
+// 勤務体制パターンAPI呼び出し
+// ========================================
+function callWorkPatternApi(partsData, jphData, workPatterns, monthlyDays) {
+  const payload = {
+    parts_data: partsData,
+    jph_data: jphData,
+    work_patterns: workPatterns,
+    monthly_working_days: monthlyDays,
+    time_limit: 60
+  };
+
+  log('勤務体制パターンAPIリクエスト送信', { endpoint: '/optimize/simple/compare-patterns' });
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(`${API_URL}/optimize/simple/compare-patterns`, options);
+  const responseCode = response.getResponseCode();
+  const responseText = response.getContentText();
+
+  log('勤務体制パターンAPIレスポンス受信', { code: responseCode, length: responseText.length });
+
+  if (responseCode !== 200) {
+    throw new Error(`HTTPエラー: ${responseCode}\n${responseText.substring(0, 200)}`);
+  }
+
+  return JSON.parse(responseText);
+}
+
+// ========================================
+// 勤務体制パターン結果書き込み
+// ========================================
+function writeWorkPatternResults(ss, response) {
+  const patternNames = response.pattern_names;
+
+  // --- パターン比較サマリーシート ---
+  const summarySheet = writeSheetData(ss, '結果_勤務体制比較', response.comparison_summary, {
+    headerBg: '#4472C4',
+    numberCols: [3, 4, 6],
+  });
+  if (summarySheet) {
+    formatComparisonSummary(summarySheet, response.comparison_summary);
+  }
+
+  // --- ライン別負荷率比較シート ---
+  writeSheetData(ss, '結果_勤務体制負荷率比較', response.line_comparison, {
+    headerBg: '#4472C4',
+  });
+
+  // --- 未割当比較シート ---
+  if (response.unmet_comparison && response.unmet_comparison.length > 1) {
+    writeSheetData(ss, '結果_勤務体制未割当比較', response.unmet_comparison, {
+      headerBg: '#4472C4',
+      warnRows: true,
+    });
+  }
+
+  // パターンヘッダー色
+  const patternColors = ['#4472C4', '#ED7D31', '#70AD47', '#FFC000'];
+
+  // --- パターン別ライン負荷シート ---
+  for (let i = 0; i < patternNames.length; i++) {
+    const name = patternNames[i];
+    const sheetName = `結果_負荷_${name}`;
+    const data = response.patterns_line_loads[name];
+    if (data && data.length > 0) {
+      const sheet = writeSheetData(ss, sheetName, data, {
+        headerBg: patternColors[i % patternColors.length],
+        numberStartCol: 2,
+        numberEndCol: 13,
+      });
+      if (sheet) {
+        formatLineLoads(sheet, data);
+      }
+    }
+  }
+
+  // --- パターン別部品割当シート ---
+  for (let i = 0; i < patternNames.length; i++) {
+    const name = patternNames[i];
+    const sheetName = `結果_割当_${name}`;
+    const data = response.patterns_allocations[name];
+    if (data && data.length > 0) {
+      const sheet = writeSheetData(ss, sheetName, data, {
+        headerBg: patternColors[i % patternColors.length],
+        numberStartCol: 3,
+        numberEndCol: 15,
+      });
+      if (sheet) {
+        formatAllocations(sheet, data);
+      }
+    }
+  }
+
+  // --- パターン別未割当シート ---
+  for (let i = 0; i < patternNames.length; i++) {
+    const name = patternNames[i];
+    const sheetName = `結果_未割当_${name}`;
+    const data = response.patterns_unmet[name];
+    if (data && data.length > 1) {
+      writeSheetData(ss, sheetName, data, {
+        headerBg: patternColors[i % patternColors.length],
+        numberStartCol: 2,
+        numberEndCol: 14,
+        warnRows: true,
+      });
+    }
+  }
+
+  // --- パターン別キャパシティシート ---
+  for (let i = 0; i < patternNames.length; i++) {
+    const name = patternNames[i];
+    const sheetName = `結果_能力_${name}`;
+    const data = response.patterns_capacities[name];
+    if (data && data.length > 0) {
+      const sheet = writeSheetData(ss, sheetName, data, {
+        headerBg: patternColors[i % patternColors.length],
+        numberStartCol: 2,
+        numberEndCol: 13,
+      });
+      if (sheet) {
+        formatCapacities(sheet, data);
+      }
+    }
+  }
+
+  log('勤務体制パターン結果書き込み完了');
+}
+
+// ========================================
 // 比較API呼び出し
 // ========================================
 function callCompareApi(partsData, capacitiesData) {
@@ -496,16 +792,22 @@ function writeComparisonResults(ss, response) {
   const patterns = response.patterns; // [100, 90, 80]
 
   // --- パターン比較サマリーシート ---
-  writeSheetData(ss, '結果_パターン比較', response.comparison_summary, {
+  const summarySheet = writeSheetData(ss, '結果_パターン比較', response.comparison_summary, {
     headerBg: '#4472C4',
     numberCols: [3, 4, 6],  // 目的関数値、実行時間、未割当合計
   });
+  if (summarySheet) {
+    formatComparisonSummary(summarySheet, response.comparison_summary);
+  }
 
   // --- ライン別負荷率比較シート ---
-  writeSheetData(ss, '結果_負荷率比較', response.line_comparison, {
+  const lineCompSheet = writeSheetData(ss, '結果_負荷率比較', response.line_comparison, {
     headerBg: '#4472C4',
-    numberCols: [2],  // 平均能力
+    numberCols: [2, 3, 5, 7],  // 平均能力 + 平均負荷列
   });
+  if (lineCompSheet) {
+    formatLineComparison(lineCompSheet, response.line_comparison, patterns);
+  }
 
   // --- 未割当比較シート ---
   if (response.unmet_comparison && response.unmet_comparison.length > 1) {
@@ -522,11 +824,14 @@ function writeComparisonResults(ss, response) {
     const sheetName = `結果_負荷_${pct}%`;
     const data = response.patterns_line_loads[key];
     if (data && data.length > 0) {
-      writeSheetData(ss, sheetName, data, {
+      const sheet = writeSheetData(ss, sheetName, data, {
         headerBg: getPatternColor(pct),
         numberStartCol: 2,
         numberEndCol: 13,
       });
+      if (sheet) {
+        formatLineLoads(sheet, data);
+      }
     }
   }
 
@@ -536,11 +841,14 @@ function writeComparisonResults(ss, response) {
     const sheetName = `結果_割当_${pct}%`;
     const data = response.patterns_allocations[key];
     if (data && data.length > 0) {
-      writeSheetData(ss, sheetName, data, {
+      const sheet = writeSheetData(ss, sheetName, data, {
         headerBg: getPatternColor(pct),
         numberStartCol: 3,
         numberEndCol: 15,
       });
+      if (sheet) {
+        formatAllocations(sheet, data);
+      }
     }
   }
 
@@ -560,11 +868,14 @@ function writeComparisonResults(ss, response) {
   }
 
   // --- キャパシティシート（共通） ---
-  writeSheetData(ss, '結果_月別能力', response.capacities, {
+  const capSheet = writeSheetData(ss, '結果_月別能力', response.capacities, {
     headerBg: '#4472C4',
     numberStartCol: 2,
     numberEndCol: 13,
   });
+  if (capSheet && response.capacities && response.capacities.length > 1) {
+    formatCapacities(capSheet, response.capacities);
+  }
 
   log('比較結果書き込み完了');
 }
@@ -630,6 +941,7 @@ function writeSheetData(ss, sheetName, data, options) {
   }
 
   log(`${sheetName} 書き込み完了`, { rows: normalizedData.length });
+  return sheet;
 }
 
 /**
@@ -645,6 +957,223 @@ function getPatternColor(pct) {
 }
 
 // ========================================
+// 色設定ヘルパー関数
+// ========================================
+
+/**
+ * パーセント文字列を数値に変換（例: "7.8%" → 7.8）
+ */
+function parseRatePercent(value) {
+  if (typeof value === 'number') return value >= 1 ? value : value * 100;
+  if (typeof value === 'string') {
+    const num = parseFloat(value.replace('%', ''));
+    return isNaN(num) ? 0 : num;
+  }
+  return 0;
+}
+
+/**
+ * 負荷率に基づく背景色を取得
+ */
+function getLoadRateColor(rate) {
+  if (rate > 100) return '#FFC7CE';  // 赤（超過）
+  if (rate > 90)  return '#FFEB9C';  // 黄（警戒）
+  if (rate > 80)  return '#C6EFCE';  // 薄緑（やや高い）
+  return null;
+}
+
+/**
+ * 負荷率に基づくフォント色を取得
+ */
+function getLoadRateFontColor(rate) {
+  if (rate > 100) return '#9C0006';  // 暗赤
+  if (rate > 90)  return '#9C6500';  // 暗黄
+  if (rate > 80)  return '#006100';  // 暗緑
+  return null;
+}
+
+/**
+ * ステータスに基づく背景色を取得
+ */
+function getStatusColor(status) {
+  const colors = {
+    'OPTIMAL': '#C6EFCE',
+    'FEASIBLE': '#FFEB9C',
+    'INFEASIBLE': '#FFC7CE',
+    'ERROR': '#FFC7CE',
+  };
+  return colors[status] || null;
+}
+
+/**
+ * ステータスに基づくフォント色を取得
+ */
+function getStatusFontColor(status) {
+  const colors = {
+    'OPTIMAL': '#006100',
+    'FEASIBLE': '#9C6500',
+    'INFEASIBLE': '#9C0006',
+    'ERROR': '#9C0006',
+  };
+  return colors[status] || null;
+}
+
+// ========================================
+// 比較結果フォーマット関数
+// ========================================
+
+/**
+ * パターン比較サマリーシートのフォーマット
+ * - ステータス列: OPTIMAL=緑, FEASIBLE=黄, ERROR=赤
+ * - 平均負荷率列: 負荷率に応じた色分け
+ * - 未割当合計列: 値がある場合は警告色
+ */
+function formatComparisonSummary(sheet, data) {
+  if (!data || data.length <= 1) return;
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const rowNum = i + 1;
+
+    // ステータス列（2列目）の色分け
+    const status = row[1];
+    const statusBg = getStatusColor(status);
+    const statusFont = getStatusFontColor(status);
+    if (statusBg) {
+      sheet.getRange(rowNum, 2).setBackground(statusBg);
+    }
+    if (statusFont) {
+      sheet.getRange(rowNum, 2).setFontColor(statusFont).setFontWeight('bold');
+    }
+
+    // 平均負荷率列（5列目）の色分け
+    const avgRate = parseRatePercent(row[4]);
+    const rateBg = getLoadRateColor(avgRate);
+    const rateFont = getLoadRateFontColor(avgRate);
+    if (rateBg) {
+      sheet.getRange(rowNum, 5).setBackground(rateBg);
+    }
+    if (rateFont) {
+      sheet.getRange(rowNum, 5).setFontColor(rateFont);
+    }
+
+    // 未割当合計列（6列目）の警告色
+    const unmet = typeof row[5] === 'number' ? row[5] : parseFloat(row[5]) || 0;
+    if (unmet > 0) {
+      sheet.getRange(rowNum, 6)
+        .setBackground('#FFC7CE')
+        .setFontColor('#9C0006')
+        .setFontWeight('bold');
+    }
+  }
+}
+
+/**
+ * ライン別負荷率比較シートのフォーマット
+ * - 各パターンの負荷率列を条件付き色分け
+ */
+function formatLineComparison(sheet, data, patterns) {
+  if (!data || data.length <= 1) return;
+
+  // 負荷率列: ライン, 平均能力, 平均負荷(100%), 負荷率(100%), 平均負荷(90%), 負荷率(90%), ...
+  // 負荷率列は 4, 6, 8 (1-based)
+  const rateCols = patterns.map((_, idx) => 4 + idx * 2);
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const rowNum = i + 1;
+
+    for (const col of rateCols) {
+      if (col - 1 < row.length) {
+        const rate = parseRatePercent(row[col - 1]);
+        const bg = getLoadRateColor(rate);
+        const font = getLoadRateFontColor(rate);
+        if (bg) {
+          sheet.getRange(rowNum, col).setBackground(bg);
+        }
+        if (font) {
+          sheet.getRange(rowNum, col).setFontColor(font).setFontWeight('bold');
+        }
+      }
+    }
+  }
+}
+
+/**
+ * パターン別ライン負荷シートのフォーマット
+ * - 負荷率列（最終列）の条件付き色分け
+ * - 平均能力・平均負荷の数値フォーマット
+ * - 100%超えの行全体を警告色
+ */
+function formatLineLoads(sheet, data) {
+  if (!data || data.length <= 1) return;
+
+  const numCols = data[0].length;
+  const rateCol = numCols;        // 負荷率（最終列）
+  const avgCapCol = numCols - 2;  // 平均能力
+
+  // 平均能力・平均負荷列の数値フォーマット
+  sheet.getRange(2, avgCapCol, data.length - 1, 2).setNumberFormat('#,##0');
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const rowNum = i + 1;
+
+    const rate = parseRatePercent(row[rateCol - 1]);
+    const bg = getLoadRateColor(rate);
+    const font = getLoadRateFontColor(rate);
+
+    if (rate > 100) {
+      // 100%超え: 行全体を警告色
+      sheet.getRange(rowNum, 1, 1, numCols).setBackground('#FFC7CE');
+      sheet.getRange(rowNum, rateCol).setFontColor('#9C0006').setFontWeight('bold');
+    } else {
+      // 負荷率セルのみ色分け
+      if (bg) {
+        sheet.getRange(rowNum, rateCol).setBackground(bg);
+      }
+      if (font) {
+        sheet.getRange(rowNum, rateCol).setFontColor(font).setFontWeight('bold');
+      }
+    }
+  }
+}
+
+/**
+ * パターン別部品割当シートのフォーマット
+ * - 交互背景色で読みやすさ向上
+ */
+function formatAllocations(sheet, data) {
+  if (!data || data.length <= 1) return;
+
+  const numCols = Math.max(...data.map(row => row.length));
+
+  for (let i = 1; i < data.length; i++) {
+    const rowNum = i + 1;
+    if (i % 2 === 0) {
+      sheet.getRange(rowNum, 1, 1, numCols).setBackground('#F2F2F2');
+    }
+  }
+}
+
+/**
+ * 月別能力シートのフォーマット
+ * - 交互背景色
+ */
+function formatCapacities(sheet, data) {
+  if (!data || data.length <= 1) return;
+
+  const numCols = Math.max(...data.map(row => row.length));
+
+  for (let i = 1; i < data.length; i++) {
+    const rowNum = i + 1;
+    if (i % 2 === 0) {
+      sheet.getRange(rowNum, 1, 1, numCols).setBackground('#F2F2F2');
+    }
+  }
+}
+
+// ========================================
 // ヘルプ
 // ========================================
 function showHelp() {
@@ -655,28 +1184,31 @@ KIRIU ライン負荷最適化システム
 1. メニュー「ライン最適化」→「テンプレートを作成」
 2. 「入力」シートに部品データを入力
    - 部品番号、メインライン、サブライン、月別需要
-3. 「ライン能力」シートで月別の能力を調整
-   - 各月ごとに異なる能力を設定可能
+3. 能力設定（以下いずれか）:
+   a) 「ライン能力」シートで月別の能力を直接設定
+   b) 勤務体制パターン方式:
+      - 「負荷率計算」シートで勤務体制と計算式を設定
+      - 「ライン製造能力」シートでJPH（時間あたり生産数）を設定
+      - 「月間稼働日数」シートで月ごとの稼働日数を設定
 4. メニュー「ライン最適化」から実行方法を選択:
    - 「最適化を実行（100%）」: 従来の単一パターン実行
-   - 「パターン比較（100/90/80%）」: 3パターン比較実行
+   - 「パターン比較（100/90/80%）」: 負荷率3パターン比較
+   - 「勤務体制パターン比較」: 勤務体制ごとに能力を計算して比較
 5. 結果シートで確認
 
-【シート構成 - 単一パターン実行時】
-- 結果_ライン負荷: ライン別月別負荷
-- 結果_部品割当: 部品別生産割当
-- 結果_未割当: 能力超過で生産できなかった数量
+【シート構成 - 勤務体制パターン比較時】
+- 結果_勤務体制比較: パターンの概要比較
+- 結果_勤務体制負荷率比較: ライン別負荷率比較
+- 結果_負荷_○○: 各パターンのライン負荷詳細
+- 結果_割当_○○: 各パターンの部品割当詳細
+- 結果_能力_○○: 各パターンの月別能力
 
-【シート構成 - パターン比較実行時】
-- 結果_パターン比較: 3パターンの概要比較
-- 結果_負荷率比較: ライン別負荷率の3パターン比較
-- 結果_未割当比較: 未割当数量の3パターン比較
-- 結果_負荷_100%/90%/80%: 各パターンのライン負荷詳細
-- 結果_割当_100%/90%/80%: 各パターンの部品割当詳細
-- 結果_未割当_100%/90%/80%: 各パターンの未割当詳細
+【能力計算式】
+月間能力 = JPH × 月稼働時間
+月稼働時間 = 計算式（例: 月間稼働日数 × 7.5 × 直数 - 月除外時間）
 
 【重要】
-- 負荷率は設定上限を超えません（ハード制約）
+- 負荷率は能力上限を超えません（ハード制約）
 - 上限を下げると未割当が増える場合があります
 
 【ログ確認方法】

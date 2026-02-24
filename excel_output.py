@@ -66,14 +66,17 @@ def _normalize_capacities(capacities: dict[str, int | list[int]]) -> dict[str, l
     return result
 
 
-def create_summary_sheet(wb: Workbook, result: OptimizationResult, capacities: dict[str, int | list[int]]):
+def create_summary_sheet(wb: Workbook, result: OptimizationResult, capacities: dict[str, int | list[int]], pattern_label: str = ''):
     """サマリーシートを作成"""
     ws = wb.active
     ws.title = 'サマリー'
     styles = create_styles()
 
     # タイトル
-    ws['A1'] = 'KIRIU ライン負荷最適化結果'
+    title = 'KIRIU ライン負荷最適化結果'
+    if pattern_label:
+        title += f' ({pattern_label})'
+    ws['A1'] = title
     ws['A1'].font = Font(bold=True, size=14)
     ws.merge_cells('A1:F1')
 
@@ -487,6 +490,7 @@ def export_to_excel(
     specs: dict[str, PartSpec],
     capacities: dict[str, int | list[int]] | None = None,
     output_path: str | None = None,
+    pattern_label: str = '',
 ) -> str:
     """
     最適化結果をExcelファイルに出力
@@ -496,6 +500,7 @@ def export_to_excel(
         specs: 部品仕様
         capacities: ライン能力（月別可、省略時はデフォルト値）
         output_path: 出力パス（省略時はoutputディレクトリ）
+        pattern_label: パターン名ラベル（例: "2直2交替"）
 
     Returns:
         出力ファイルパス
@@ -505,7 +510,7 @@ def export_to_excel(
     wb = Workbook()
 
     # 各シートを作成
-    create_summary_sheet(wb, result, caps)
+    create_summary_sheet(wb, result, caps, pattern_label=pattern_label)
     create_line_capacity_sheet(wb, result, caps)
     create_part_allocation_sheet(wb, result, specs)
     create_unmet_demand_sheet(wb, result, specs)  # 未割当シートを追加

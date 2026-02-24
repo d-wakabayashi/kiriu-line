@@ -11,7 +11,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import DISC_LINES, DEFAULT_CAPACITIES, MONTHS
+from config import (
+    DISC_LINES, DEFAULT_CAPACITIES, MONTHS,
+    DEFAULT_JPH, DEFAULT_WORK_PATTERNS, DEFAULT_MONTHLY_WORKING_DAYS,
+    WorkPattern, calculate_monthly_capacities,
+)
 from model import optimize, OptimizationResult
 from data_loader import PartSpec, PartDemand
 
@@ -625,6 +629,236 @@ def run_compare_optimization(request: CompareOptimizeRequest):
         # キャパシティ（共通）
         "capacities": [["ライン"] + MONTHS]
             + [[line] + monthly_capacities[line] for line in DISC_LINES],
+    }
+
+
+# ============================================================
+# 勤務体制パターン比較API
+# ============================================================
+
+class WorkPatternInput(BaseModel):
+    """勤務体制パターン入力"""
+    name: str                   # 例: "2直2交替"
+    formula: str                # 例: "{月間稼働日数} * 7.5 * 2 - {月除外時間}"
+    exclusion_hours: float = 0  # 月除外時間
+
+
+class CompareByWorkPatternRequest(BaseModel):
+    """勤務体制パターン比較リクエスト（2次元配列形式）"""
+    parts_data: list[list[Any]]
+    jph_data: list[list[Any]] | None = None           # [[ライン, JPH], ...]
+    work_patterns: list[WorkPatternInput] | None = None
+    monthly_working_days: list[float] | None = None   # 12ヶ月分
+    time_limit: int = 60
+
+
+@app.post("/optimize/simple/compare-patterns")
+def run_work_pattern_comparison(request: CompareByWorkPatternRequest):
+    """
+    勤務体制パターンごとに能力を計算し、最適化を実行して比較結果を返す
+
+    jph_data形式: [["ライン", "JPH"], ["4915", 350], ...]
+    work_patterns形式: [{"name": "2直2交替", "formula": "...", "exclusion_hours": 5}, ...]
+    monthly_working_days形式: [20, 19, 21, ...]  (12ヶ月分)
+    """
+    # parts_data パース（既存の _parse_simple_request を再利用）
+    simple_req = SimpleOptimizeRequest(
+        parts_data=request.parts_data,
+        capacities_data=None,
+        time_limit=request.time_limit,
+    )
+    specs, demands, _ = _parse_simple_request(simple_req)
+
+    # JPH パース
+    jph: dict[str, float] = dict(DEFAULT_JPH)
+    if request.jph_data:
+        for row in request.jph_data:
+            if len(row) < 2:
+                continue
+            line = str(row[0]).strip()
+            if line not in DISC_LINES or line == 'ライン':
+                continue
+            try:
+                jph[line] = float(row[1]) if row[1] else 0
+            except (ValueError, TypeError):
+                pass
+
+    # 勤務体制パターン パース
+    patterns: list[WorkPattern] = []
+    if request.work_patterns:
+        for wp in request.work_patterns:
+            patterns.append(WorkPattern(
+                name=wp.name,
+                formula=wp.formula,
+                exclusion_hours=wp.exclusion_hours,
+            ))
+    else:
+        patterns = list(DEFAULT_WORK_PATTERNS)
+
+    # 月間稼働日数
+    working_days = request.monthly_working_days or list(DEFAULT_MONTHLY_WORKING_DAYS)
+    if len(working_days) < 12:
+        working_days.extend([20] * (12 - len(working_days)))
+
+    # パターン別能力計算
+    pattern_capacities = calculate_monthly_capacities(jph, patterns, working_days)
+
+    # 各パターンで最適化実行
+    pattern_results = {}
+    for pattern_name, capacities in pattern_capacities.items():
+        try:
+            result = optimize(specs, demands, capacities, request.time_limit)
+            pattern_results[pattern_name] = result
+        except Exception:
+            pattern_results[pattern_name] = None
+
+    pattern_names = [p.name for p in patterns]
+
+    # === パターン比較サマリー ===
+    summary_array = [["勤務体制", "ステータス", "目的関数値", "実行時間(秒)", "平均負荷率", "未割当合計"]]
+    for name in pattern_names:
+        result = pattern_results.get(name)
+        capacities = pattern_capacities[name]
+        if result is None:
+            summary_array.append([name, "ERROR", "", "", "", ""])
+            continue
+        total_load = sum(sum(loads) for loads in result.line_loads.values())
+        total_cap = sum(sum(capacities.get(line, [0] * 12)) for line in DISC_LINES)
+        avg_rate_val = total_load / total_cap if total_cap > 0 else 0
+        total_unmet = sum(sum(u) for u in result.unmet_demand.values()) if result.unmet_demand else 0
+        summary_array.append([
+            name,
+            result.status,
+            result.objective_value,
+            round(result.solve_time, 2),
+            f"{avg_rate_val:.1%}",
+            total_unmet,
+        ])
+
+    # === ライン別負荷率比較 ===
+    line_comparison_header = ["ライン", "JPH"]
+    for name in pattern_names:
+        line_comparison_header.extend([f"平均能力({name})", f"平均負荷({name})", f"負荷率({name})"])
+    line_comparison_array = [line_comparison_header]
+
+    for line in DISC_LINES:
+        row = [line, jph.get(line, 0)]
+        for name in pattern_names:
+            capacities = pattern_capacities[name]
+            result = pattern_results.get(name)
+            line_caps = capacities.get(line, [0] * 12)
+            avg_cap = sum(line_caps) / 12
+            if result is None:
+                row.extend(["", "", ""])
+                continue
+            loads = result.line_loads.get(line, [0] * 12)
+            avg_load = sum(loads) / 12
+            load_rate_val = avg_load / avg_cap if avg_cap > 0 else 0
+            row.extend([int(avg_cap), int(avg_load), f"{load_rate_val:.1%}"])
+        line_comparison_array.append(row)
+
+    # === パターン別ライン月別負荷 ===
+    patterns_line_loads = {}
+    for name in pattern_names:
+        capacities = pattern_capacities[name]
+        result = pattern_results.get(name)
+        if result is None:
+            patterns_line_loads[name] = []
+            continue
+
+        line_loads_array = [["ライン"] + MONTHS + ["平均能力", "平均負荷", "負荷率"]]
+        for line in DISC_LINES:
+            loads = result.line_loads.get(line, [0] * 12)
+            line_caps = capacities.get(line, [0] * 12)
+            avg_cap = sum(line_caps) / 12
+            avg_load = sum(loads) / 12
+            load_rate_val = avg_load / avg_cap if avg_cap > 0 else 0
+            line_loads_array.append(
+                [line] + loads + [int(avg_cap), int(avg_load), f"{load_rate_val:.1%}"]
+            )
+        patterns_line_loads[name] = line_loads_array
+
+    # === パターン別部品割当 ===
+    patterns_allocations = {}
+    for name in pattern_names:
+        result = pattern_results.get(name)
+        if result is None:
+            patterns_allocations[name] = []
+            continue
+        alloc_array = [["部品番号", "割当ライン"] + MONTHS + ["年間計"]]
+        for part_num in sorted(result.allocation.keys()):
+            for line, monthly in result.allocation[part_num].items():
+                if sum(monthly) > 0:
+                    alloc_array.append([part_num, line] + monthly + [sum(monthly)])
+        patterns_allocations[name] = alloc_array
+
+    # === パターン別未割当 ===
+    patterns_unmet = {}
+    for name in pattern_names:
+        result = pattern_results.get(name)
+        if result is None:
+            patterns_unmet[name] = []
+            continue
+        unmet_array = [["部品番号"] + MONTHS + ["年間計"]]
+        if result.unmet_demand:
+            for part_num in sorted(result.unmet_demand.keys()):
+                monthly_unmet = result.unmet_demand[part_num]
+                if sum(monthly_unmet) > 0:
+                    unmet_array.append([part_num] + monthly_unmet + [sum(monthly_unmet)])
+        patterns_unmet[name] = unmet_array
+
+    # === 未割当比較 ===
+    unmet_comparison_header = ["部品番号"]
+    for name in pattern_names:
+        unmet_comparison_header.append(f"未割当({name})")
+    unmet_comparison_array = [unmet_comparison_header]
+
+    all_unmet_parts = set()
+    for result in pattern_results.values():
+        if result and result.unmet_demand:
+            for part_num, monthly in result.unmet_demand.items():
+                if sum(monthly) > 0:
+                    all_unmet_parts.add(part_num)
+
+    for part_num in sorted(all_unmet_parts):
+        row = [part_num]
+        for name in pattern_names:
+            result = pattern_results.get(name)
+            if result and result.unmet_demand and part_num in result.unmet_demand:
+                row.append(sum(result.unmet_demand[part_num]))
+            else:
+                row.append(0)
+        unmet_comparison_array.append(row)
+
+    # === パターン別キャパシティ ===
+    patterns_capacities_output = {}
+    for name in pattern_names:
+        capacities = pattern_capacities[name]
+        cap_array = [["ライン"] + MONTHS]
+        for line in DISC_LINES:
+            cap_array.append([line] + capacities.get(line, [0] * 12))
+        patterns_capacities_output[name] = cap_array
+
+    total_demand = sum(sum(d.monthly_demand) for d in demands.values())
+
+    return {
+        "success": any(
+            r is not None and r.status in ('OPTIMAL', 'FEASIBLE')
+            for r in pattern_results.values()
+        ),
+        "pattern_names": pattern_names,
+        "parts_count": len(specs),
+        "total_demand": total_demand,
+        # 比較データ
+        "comparison_summary": summary_array,
+        "line_comparison": line_comparison_array,
+        "unmet_comparison": unmet_comparison_array,
+        # パターン別詳細データ
+        "patterns_line_loads": patterns_line_loads,
+        "patterns_allocations": patterns_allocations,
+        "patterns_unmet": patterns_unmet,
+        # パターン別キャパシティ
+        "patterns_capacities": patterns_capacities_output,
     }
 
 

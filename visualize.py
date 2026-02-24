@@ -215,6 +215,7 @@ def generate_text_report(
     result: OptimizationResult,
     capacities: dict[str, int] | None = None,
     output_path: str | None = None,
+    pattern_label: str = '',
 ) -> str:
     """
     テキストレポートを生成
@@ -223,15 +224,20 @@ def generate_text_report(
         result: 最適化結果
         capacities: ライン能力辞書
         output_path: 出力ファイルパス
+        pattern_label: パターン名ラベル（例: "2直2交替"）
 
     Returns:
         レポート文字列
     """
     caps = capacities or DEFAULT_CAPACITIES
 
+    title = "KIRIU ライン負荷最適化レポート"
+    if pattern_label:
+        title += f" ({pattern_label})"
+
     lines = []
     lines.append("=" * 60)
-    lines.append("KIRIU ライン負荷最適化レポート")
+    lines.append(title)
     lines.append("=" * 60)
     lines.append("")
 
@@ -382,6 +388,7 @@ def generate_all_outputs(
     result: OptimizationResult,
     capacities: dict[str, int] | None = None,
     output_dir: str | None = None,
+    pattern_label: str = '',
 ) -> None:
     """
     全ての出力ファイルを生成
@@ -390,6 +397,7 @@ def generate_all_outputs(
         result: 最適化結果
         capacities: ライン能力辞書
         output_dir: 出力ディレクトリパス（指定時は各ファイルをこのディレクトリに出力）
+        pattern_label: パターン名ラベル（例: "2直2交替"）
     """
     print("\n出力ファイル生成中...")
 
@@ -398,12 +406,12 @@ def generate_all_outputs(
         out.mkdir(parents=True, exist_ok=True)
         plot_line_loads(result, capacities, output_path=str(out / 'line_loads.png'))
         plot_load_summary(result, capacities, output_path=str(out / 'load_summary.png'))
-        report = generate_text_report(result, capacities, output_path=str(out / 'optimization_report.txt'))
+        report = generate_text_report(result, capacities, output_path=str(out / 'optimization_report.txt'), pattern_label=pattern_label)
         save_solution_json(result, output_path=str(out / 'solution.json'))
     else:
         plot_line_loads(result, capacities)
         plot_load_summary(result, capacities)
-        report = generate_text_report(result, capacities)
+        report = generate_text_report(result, capacities, pattern_label=pattern_label)
         save_solution_json(result)
 
     print("\n" + report)
