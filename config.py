@@ -65,7 +65,17 @@ def evaluate_work_formula(formula: str, days: float, exclusion: float) -> float:
     Returns:
         月稼働時間
     """
-    expr = formula.replace('{月間稼働日数}', str(float(days)))
+    # 全角記号・スペースを半角に正規化
+    normalized = formula
+    normalized = normalized.replace('×', '*')
+    normalized = normalized.replace('÷', '/')
+    normalized = normalized.replace('＋', '+')
+    normalized = normalized.replace('－', '-')
+    normalized = normalized.replace('（', '(')
+    normalized = normalized.replace('）', ')')
+    normalized = normalized.replace('\u3000', ' ')  # 全角スペース
+
+    expr = normalized.replace('{月間稼働日数}', str(float(days)))
     expr = expr.replace('{月除外時間}', str(float(exclusion)))
 
     # 安全な評価: 数字、演算子、空白、小数点のみ許可
