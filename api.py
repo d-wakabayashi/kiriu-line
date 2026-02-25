@@ -661,6 +661,18 @@ def run_work_pattern_comparison(request: CompareByWorkPatternRequest):
     work_patterns形式: [{"name": "2直2交替", "formula": "...", "exclusion_hours": 5}, ...]
     monthly_working_days形式: [20, 19, 21, ...]  (12ヶ月分)
     """
+    try:
+        return _run_work_pattern_comparison_impl(request)
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"勤務体制パターン比較エラー: {str(e)}")
+
+
+def _run_work_pattern_comparison_impl(request: CompareByWorkPatternRequest):
+    """勤務体制パターン比較の実装"""
     # parts_data パース（既存の _parse_simple_request を再利用）
     simple_req = SimpleOptimizeRequest(
         parts_data=request.parts_data,

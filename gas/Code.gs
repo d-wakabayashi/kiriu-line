@@ -528,65 +528,65 @@ function runWorkPatternComparison() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const ui = SpreadsheetApp.getUi();
 
-  log('勤務体制パターン比較実行開始');
-
-  // 入力データ取得
-  const inputSheet = ss.getSheetByName('入力');
-  if (!inputSheet) {
-    ui.alert('エラー', '「入力」シートが見つかりません', ui.ButtonSet.OK);
-    return;
-  }
-
-  const inputData = inputSheet.getDataRange().getValues();
-  if (inputData.length < 2) {
-    ui.alert('エラー', '入力データがありません', ui.ButtonSet.OK);
-    return;
-  }
-
-  // 勤務体制パターン関連シートの読み込み
-  const wpSheet = ss.getSheetByName('負荷率計算');
-  const jphSheet = ss.getSheetByName('ライン製造能力');
-  const daysSheet = ss.getSheetByName('月間稼働日数');
-
-  if (!wpSheet || !jphSheet || !daysSheet) {
-    ui.alert('エラー',
-      '勤務体制パターン関連シートが見つかりません。\n' +
-      'テンプレートを作成してデータを入力してください。\n\n' +
-      '必要なシート: 負荷率計算、ライン製造能力、月間稼働日数',
-      ui.ButtonSet.OK);
-    return;
-  }
-
-  // 勤務体制パターン読み込み
-  const wpData = wpSheet.getDataRange().getValues();
-  const workPatterns = [];
-  for (let i = 1; i < wpData.length; i++) {
-    const row = wpData[i];
-    if (row[0] && row[1]) {
-      workPatterns.push({
-        name: String(row[0]).trim(),
-        formula: String(row[1]).trim(),
-        exclusion_hours: parseFloat(row[2]) || 0
-      });
-    }
-  }
-
-  if (workPatterns.length === 0) {
-    ui.alert('エラー', '負荷率計算シートに有効なパターンがありません', ui.ButtonSet.OK);
-    return;
-  }
-
-  // JPHデータ読み込み
-  const jphData = jphSheet.getDataRange().getValues();
-
-  // 月間稼働日数読み込み
-  const daysData = daysSheet.getDataRange().getValues();
-  let monthlyDays = [];
-  if (daysData.length >= 2) {
-    monthlyDays = daysData[1].slice(0, 12).map(v => parseFloat(v) || 20);
-  }
-
   try {
+    log('勤務体制パターン比較実行開始');
+
+    // 入力データ取得
+    const inputSheet = ss.getSheetByName('入力');
+    if (!inputSheet) {
+      ui.alert('エラー', '「入力」シートが見つかりません', ui.ButtonSet.OK);
+      return;
+    }
+
+    const inputData = inputSheet.getDataRange().getValues();
+    if (inputData.length < 2) {
+      ui.alert('エラー', '入力データがありません', ui.ButtonSet.OK);
+      return;
+    }
+
+    // 勤務体制パターン関連シートの読み込み
+    const wpSheet = ss.getSheetByName('負荷率計算');
+    const jphSheet = ss.getSheetByName('ライン製造能力');
+    const daysSheet = ss.getSheetByName('月間稼働日数');
+
+    if (!wpSheet || !jphSheet || !daysSheet) {
+      ui.alert('エラー',
+        '勤務体制パターン関連シートが見つかりません。\n' +
+        'テンプレートを作成してデータを入力してください。\n\n' +
+        '必要なシート: 負荷率計算、ライン製造能力、月間稼働日数',
+        ui.ButtonSet.OK);
+      return;
+    }
+
+    // 勤務体制パターン読み込み
+    const wpData = wpSheet.getDataRange().getValues();
+    const workPatterns = [];
+    for (let i = 1; i < wpData.length; i++) {
+      const row = wpData[i];
+      if (row[0] && row[1]) {
+        workPatterns.push({
+          name: String(row[0]).trim(),
+          formula: String(row[1]).trim(),
+          exclusion_hours: parseFloat(row[2]) || 0
+        });
+      }
+    }
+
+    if (workPatterns.length === 0) {
+      ui.alert('エラー', '負荷率計算シートに有効なパターンがありません', ui.ButtonSet.OK);
+      return;
+    }
+
+    // JPHデータ読み込み
+    const jphData = jphSheet.getDataRange().getValues();
+
+    // 月間稼働日数読み込み
+    const daysData = daysSheet.getDataRange().getValues();
+    let monthlyDays = [];
+    if (daysData.length >= 2) {
+      monthlyDays = daysData[1].slice(0, 12).map(v => parseFloat(v) || 20);
+    }
+
     log('勤務体制パターンAPI呼び出し開始', { patterns: workPatterns.length });
 
     const response = callWorkPatternApi(inputData, jphData, workPatterns, monthlyDays);
@@ -602,7 +602,9 @@ function runWorkPatternComparison() {
     }
 
     // 結果を書き込み
+    log('結果書き込み開始');
     writeWorkPatternResults(ss, response);
+    log('結果書き込み完了');
 
     ui.alert('完了',
       `勤務体制パターン比較最適化が完了しました\n\n` +
@@ -614,8 +616,11 @@ function runWorkPatternComparison() {
     );
 
   } catch (error) {
-    log('エラー発生', { message: error.message, stack: error.stack });
-    ui.alert('エラー', `API呼び出しに失敗しました:\n${error.message}`, ui.ButtonSet.OK);
+    log('エラー発生', { message: String(error), stack: error.stack || 'no stack' });
+    ui.alert('エラー',
+      `処理中にエラーが発生しました:\n${String(error)}\n\n` +
+      `詳細はApps Scriptの実行ログを確認してください。`,
+      ui.ButtonSet.OK);
   }
 }
 
@@ -658,8 +663,10 @@ function callWorkPatternApi(partsData, jphData, workPatterns, monthlyDays) {
 // ========================================
 function writeWorkPatternResults(ss, response) {
   const patternNames = response.pattern_names;
+  log('writeWorkPatternResults開始', { patternNames: patternNames });
 
   // --- パターン比較サマリーシート ---
+  log('結果_勤務体制比較 書き込み中');
   const summarySheet = writeSheetData(ss, '結果_勤務体制比較', response.comparison_summary, {
     headerBg: '#4472C4',
     numberCols: [3, 4, 6],
@@ -669,12 +676,14 @@ function writeWorkPatternResults(ss, response) {
   }
 
   // --- ライン別負荷率比較シート ---
+  log('結果_勤務体制負荷率比較 書き込み中');
   writeSheetData(ss, '結果_勤務体制負荷率比較', response.line_comparison, {
     headerBg: '#4472C4',
   });
 
   // --- 未割当比較シート ---
   if (response.unmet_comparison && response.unmet_comparison.length > 1) {
+    log('結果_勤務体制未割当比較 書き込み中');
     writeSheetData(ss, '結果_勤務体制未割当比較', response.unmet_comparison, {
       headerBg: '#4472C4',
       warnRows: true,
@@ -688,6 +697,7 @@ function writeWorkPatternResults(ss, response) {
   for (let i = 0; i < patternNames.length; i++) {
     const name = patternNames[i];
     const sheetName = `結果_負荷_${name}`;
+    log(`${sheetName} 書き込み中`);
     const data = response.patterns_line_loads[name];
     if (data && data.length > 0) {
       const sheet = writeSheetData(ss, sheetName, data, {
@@ -705,6 +715,7 @@ function writeWorkPatternResults(ss, response) {
   for (let i = 0; i < patternNames.length; i++) {
     const name = patternNames[i];
     const sheetName = `結果_割当_${name}`;
+    log(`${sheetName} 書き込み中`);
     const data = response.patterns_allocations[name];
     if (data && data.length > 0) {
       const sheet = writeSheetData(ss, sheetName, data, {
@@ -724,6 +735,7 @@ function writeWorkPatternResults(ss, response) {
     const sheetName = `結果_未割当_${name}`;
     const data = response.patterns_unmet[name];
     if (data && data.length > 1) {
+      log(`${sheetName} 書き込み中`);
       writeSheetData(ss, sheetName, data, {
         headerBg: patternColors[i % patternColors.length],
         numberStartCol: 2,
@@ -737,6 +749,7 @@ function writeWorkPatternResults(ss, response) {
   for (let i = 0; i < patternNames.length; i++) {
     const name = patternNames[i];
     const sheetName = `結果_能力_${name}`;
+    log(`${sheetName} 書き込み中`);
     const data = response.patterns_capacities[name];
     if (data && data.length > 0) {
       const sheet = writeSheetData(ss, sheetName, data, {
